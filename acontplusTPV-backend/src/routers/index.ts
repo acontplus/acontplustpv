@@ -15,6 +15,7 @@ import { creditsRouter }      from './credits'
 import { inventoryRouter }    from './inventory'
 import { purchasingRouter }   from './purchasing'
 import { payrollRouter }      from './payroll'
+import { auditRouter }        from './audit'    // Paso 11 — Arqueo de inventario
 
 export const appRouter = router({
   auth:        authRouter,
@@ -28,8 +29,8 @@ export const appRouter = router({
   credits:     creditsRouter,
   inventory:   inventoryRouter,
   purchasing:  purchasingRouter,
-  payroll:     payrollRouter,     // Paso 10 — Nómina y anticipos
-  // audit:       auditRouter,    // Paso 11 — Arqueo de inventario
+  payroll:     payrollRouter,   // Paso 10 — Nómina y anticipos
+  audit:       auditRouter,     // Paso 11 — Arqueo de inventario
 })
 
 export type AppRouter = typeof appRouter
