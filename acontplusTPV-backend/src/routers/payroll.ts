@@ -379,16 +379,24 @@ export const payrollRouter = router({
         (commissionableAmount * commissionRate).toFixed(2),
       )
 
-      // 5. Sumar anticipos y ajustes
+      // 5. Sumar anticipos, ajustes manuales y comisiones manuales
       const advancesDeducted = parseFloat(
         advances
           .filter(e => e.type === LedgerEntryType.ADVANCE_RECEIVED)
           .reduce((s, e) => s + Number(e.amount), 0)
           .toFixed(2),
       )
+      // ADJUSTMENT: ajustes manuales (positivos o negativos) — suman al neto
       const otherAdjustments = parseFloat(
         advances
           .filter(e => e.type === LedgerEntryType.ADJUSTMENT)
+          .reduce((s, e) => s + Number(e.amount), 0)
+          .toFixed(2),
+      )
+      // COMMISSION_EARNED: comisiones manuales adicionales — suman al neto
+      const manualCommissions = parseFloat(
+        advances
+          .filter(e => e.type === LedgerEntryType.COMMISSION_EARNED)
           .reduce((s, e) => s + Number(e.amount), 0)
           .toFixed(2),
       )
@@ -397,8 +405,9 @@ export const payrollRouter = router({
       const creditConsumptions = parseFloat(Number(creditDebts[0]?.pending_debt ?? 0).toFixed(2))
 
       // 7. Neto estimado (sin PER_DAY/PER_SHIFT — esos necesitan unidades)
+      //    Fórmula idéntica a closePayroll para que la pantalla nunca mienta.
       const netPaymentEstimate = parseFloat(
-        (baseSalary + commissionsEarned + otherAdjustments - advancesDeducted - creditConsumptions)
+        (baseSalary + commissionsEarned + manualCommissions + otherAdjustments - advancesDeducted - creditConsumptions)
           .toFixed(2),
       )
 
@@ -421,6 +430,7 @@ export const payrollRouter = router({
         commissionableAmount,
         commissionRate,
         commissionsEarned,
+        manualCommissions,
         advancesDeducted,
         otherAdjustments,
         creditConsumptions,
@@ -464,226 +474,294 @@ export const payrollRouter = router({
       const { tenantId, userId: adminId, establishmentId, deviceId } = ctx.auth
       const { id: businessDayId } = ctx.businessDay
 
-      const result = await withTenantOptions(
-        tenantId,
-        async (tx) => {
-          // 1. Obtener contrato vigente
-          const contract = await tx.employeeContract.findFirst({
-            where: {
-              tenantId,
-              userId:      input.userId,
-              effectiveTo: null,
-              deletedAt:   null,
-            },
-            select: {
-              id:             true,
-              salaryType:     true,
-              payPeriod:      true,
-              baseAmount:     true,
-              commissionRate: true,
-            },
-            orderBy: { effectiveFrom: 'desc' },
-          })
+      let result: Awaited<ReturnType<typeof withTenantOptions<{
+        payrollRecord: { id: string; netPayment: { toString(): string }; }
+        salaryLedgerEntry: { id: string }
+        cashEventId: string | null
+        hasPendingAdjustments: boolean
+      }>>>
 
-          if (!contract) {
-            throw new TRPCError({
-              code:    'NOT_FOUND',
-              message: 'El empleado no tiene contrato vigente',
+      try {
+        result = await withTenantOptions(
+          tenantId,
+          async (tx) => {
+            // 1. Obtener contrato vigente
+            const contract = await tx.employeeContract.findFirst({
+              where: {
+                tenantId,
+                userId:      input.userId,
+                effectiveTo: null,
+                deletedAt:   null,
+              },
+              select: {
+                id:             true,
+                salaryType:     true,
+                payPeriod:      true,
+                baseAmount:     true,
+                commissionRate: true,
+              },
+              orderBy: { effectiveFrom: 'desc' },
             })
-          }
 
-          const refDate = input.referenceDate ? new Date(input.referenceDate) : new Date()
-          const { periodStart, periodEnd } = computePeriodRange(contract.payPeriod, refDate)
-
-          // 2. Verificar que no existe ya un PayrollRecord para este período
-          //    Protección contra doble cierre — condición de carrera resuelta con
-          //    la unicidad de la FK ledgerEntryId @unique en PayrollRecord
-          const existing = await tx.payrollRecord.findFirst({
-            where: {
-              tenantId,
-              userId:      input.userId,
-              periodStart: { lte: periodEnd },
-              periodEnd:   { gte: periodStart },
-            },
-            select: { id: true, periodStart: true, periodEnd: true },
-          })
-
-          if (existing) {
-            throw new TRPCError({
-              code:    'CONFLICT',
-              message: `Ya existe un cierre de nómina para este período (${
-                existing.periodStart.toISOString().split('T')[0]
-              } → ${existing.periodEnd.toISOString().split('T')[0]})`,
-            })
-          }
-
-          // 3. Recalcular valores finales con workedDaysOrShifts definitivo
-          const baseAmount     = Number(contract.baseAmount)
-          const commissionRate = Number(contract.commissionRate)
-
-          let baseSalary: number
-          if (contract.salaryType === SalaryType.FIXED) {
-            baseSalary = baseAmount
-          } else {
-            // PER_DAY o PER_SHIFT: requiere unidades trabajadas
-            if (!input.workedDaysOrShifts) {
+            if (!contract) {
               throw new TRPCError({
-                code:    'BAD_REQUEST',
-                message: `El contrato es de tipo ${contract.salaryType} — se requiere workedDaysOrShifts`,
+                code:    'NOT_FOUND',
+                message: 'El empleado no tiene contrato vigente',
               })
             }
-            baseSalary = parseFloat((baseAmount * input.workedDaysOrShifts).toFixed(2))
-          }
 
-          // Pedidos que generan comisión — recalculo definitivo
-          const commissionOrders = await tx.order.findMany({
-            where: {
-              tenantId,
-              createdByUserId: input.userId,
-              status:          { in: ['PAID_CASH', 'PAID_TRANSFER_CONFIRMED'] },
-              createdAt:       { gte: periodStart, lte: periodEnd },
-            },
-            select: { totalAmount: true },
-          })
+            const refDate = input.referenceDate ? new Date(input.referenceDate) : new Date()
+            const { periodStart, periodEnd } = computePeriodRange(contract.payPeriod, refDate)
 
-          const commissionableAmount = parseFloat(
-            commissionOrders.reduce((s, o) => s + Number(o.totalAmount), 0).toFixed(2),
-          )
-          const commissionsEarned = parseFloat(
-            (commissionableAmount * commissionRate).toFixed(2),
-          )
-
-          // Anticipos del período
-          const advanceEntries = await tx.employeeLedgerEntry.findMany({
-            where: {
-              tenantId,
-              userId:    input.userId,
-              type:      LedgerEntryType.ADVANCE_RECEIVED,
-              createdAt: { gte: periodStart, lte: periodEnd },
-            },
-            select: { amount: true },
-          })
-          const advancesDeducted = parseFloat(
-            advanceEntries.reduce((s, e) => s + Number(e.amount), 0).toFixed(2),
-          )
-
-          // Consumos de crédito sin aplicar a nómina
-          const creditResult = await tx.$queryRaw<Array<{ pending_debt: number }>>`
-            SELECT COALESCE(
-              SUM(CASE WHEN type = 'CREDIT_ISSUED' THEN amount ELSE 0 END) -
-              SUM(CASE WHEN type IN ('PAYMENT_RECEIVED','CREDIT_CANCELLED','DISCOUNT_APPLIED')
-                  THEN COALESCE("appliedAmount", amount) ELSE 0 END),
-              0
-            ) AS pending_debt
-            FROM "CreditTransaction"
-            WHERE "tenantId"             = ${tenantId}::uuid
-              AND "debtorUserId"         = ${input.userId}::uuid
-              AND "appliedToPayrollId"   IS NULL
-          `
-          const creditConsumptions = parseFloat(
-            Number(creditResult[0]?.pending_debt ?? 0).toFixed(2),
-          )
-
-          const netPayment = parseFloat(
-            (baseSalary + commissionsEarned - advancesDeducted - creditConsumptions).toFixed(2),
-          )
-
-          // ¿Hay transferencias pendientes en el período que afecten comisiones?
-          const pendingTransferCount = await tx.order.count({
-            where: {
-              tenantId,
-              createdByUserId: input.userId,
-              status:          'PAID_TRANSFER_PENDING',
-              createdAt:       { gte: periodStart, lte: periodEnd },
-            },
-          })
-          // hasPendingAdjustments = TRUE si hay PAID_TRANSFER_PENDING
-          // (Corregido respecto al prompt de Gemini — el flag se marca TRUE al cerrar
-          // y el Paso 7 lo pone en FALSE cuando confirma las transferencias)
-          const hasPendingAdjustments = pendingTransferCount > 0
-
-          const effectiveDevice = deviceId ?? (
-            await tx.device.findFirst({
-              where: { tenantId, establishmentId, isActive: true, deletedAt: null },
-              select: { id: true },
-            }).then(d => d?.id)
-          )
-
-          if (!effectiveDevice) {
-            throw new TRPCError({
-              code:    'PRECONDITION_FAILED',
-              message: 'No hay dispositivos activos en este establecimiento',
+            // 2. Verificar que no existe ya un PayrollRecord para este período
+            //    Protección contra doble cierre — condición de carrera resuelta con
+            //    la unicidad de la FK ledgerEntryId @unique en PayrollRecord
+            const existing = await tx.payrollRecord.findFirst({
+              where: {
+                tenantId,
+                userId:      input.userId,
+                periodStart: { lte: periodEnd },
+                periodEnd:   { gte: periodStart },
+              },
+              select: { id: true, periodStart: true, periodEnd: true },
             })
-          }
 
-          // 4. Crear EmployeeLedgerEntry(SALARY_PAYMENT)
-          //    OBLIGATORIO: PayrollRecord.ledgerEntryId @unique requiere este registro
-          const salaryLedgerEntry = await tx.employeeLedgerEntry.create({
-            data: {
-              tenantId,
-              establishmentId,
-              userId:       input.userId,
-              type:         LedgerEntryType.SALARY_PAYMENT,
-              amount:       netPayment,
-              businessDayId,
-              authorizedBy: adminId!,
-              deviceId:     effectiveDevice,
-              notes:        input.notes
-                ? `Cierre de nómina | ${input.notes}`
-                : `Cierre de nómina ${periodStart.toISOString().split('T')[0]} → ${periodEnd.toISOString().split('T')[0]}`,
-            },
-          })
+            if (existing) {
+              throw new TRPCError({
+                code:    'CONFLICT',
+                message: `Ya existe un cierre de nómina para este período (${
+                  existing.periodStart.toISOString().split('T')[0]
+                } → ${existing.periodEnd.toISOString().split('T')[0]})`,
+              })
+            }
 
-          // 5. Crear PayrollRecord (snapshot inmutable — sin updatedAt)
-          const payrollRecord = await tx.payrollRecord.create({
-            data: {
-              tenantId,
-              userId:               input.userId,
-              contractSnapshotId:   contract.id,
-              periodStart,
-              periodEnd,
-              workedDaysOrShifts:   input.workedDaysOrShifts ?? null,
-              baseSalary,
-              commissionableAmount,
-              commissionRate,
-              commissionsEarned,
-              advancesDeducted,
-              creditConsumptions,
-              netPayment,
-              paymentMethod:        input.paymentMethod,
-              receiptUrl:           input.receiptUrl ?? null,
-              hasPendingAdjustments,
-              paidBy:               adminId!,
-              paidAt:               new Date(),
-              notes:                input.notes ?? null,
-              ledgerEntryId:        salaryLedgerEntry.id,
-            },
-          })
+            // 3. Recalcular valores finales con workedDaysOrShifts definitivo
+            const baseAmount     = Number(contract.baseAmount)
+            const commissionRate = Number(contract.commissionRate)
 
-          // 6. Si pago en efectivo: CashRegisterEvent(CASH_OUT_ADJUSTMENT)
-          //    No existe SALARY_PAYMENT en CashEventType — usamos CASH_OUT_ADJUSTMENT
-          //    que es la salida administrativa correcta para pagos de nómina
-          let cashEventId: string | null = null
-          if (input.paymentMethod === 'CASH') {
-            const cashEvent = await tx.cashRegisterEvent.create({
+            let baseSalary: number
+            if (contract.salaryType === SalaryType.FIXED) {
+              baseSalary = baseAmount
+            } else {
+              // PER_DAY o PER_SHIFT: requiere unidades trabajadas
+              if (!input.workedDaysOrShifts) {
+                throw new TRPCError({
+                  code:    'BAD_REQUEST',
+                  message: `El contrato es de tipo ${contract.salaryType} — se requiere workedDaysOrShifts`,
+                })
+              }
+              baseSalary = parseFloat((baseAmount * input.workedDaysOrShifts).toFixed(2))
+            }
+
+            // Pedidos que generan comisión — recalculo definitivo
+            const commissionOrders = await tx.order.findMany({
+              where: {
+                tenantId,
+                createdByUserId: input.userId,
+                status:          { in: ['PAID_CASH', 'PAID_TRANSFER_CONFIRMED'] },
+                createdAt:       { gte: periodStart, lte: periodEnd },
+              },
+              select: { totalAmount: true },
+            })
+
+            const commissionableAmount = parseFloat(
+              commissionOrders.reduce((s, o) => s + Number(o.totalAmount), 0).toFixed(2),
+            )
+            const commissionsEarned = parseFloat(
+              (commissionableAmount * commissionRate).toFixed(2),
+            )
+
+            // Anticipos del período
+            const advanceEntries = await tx.employeeLedgerEntry.findMany({
+              where: {
+                tenantId,
+                userId:    input.userId,
+                type:      LedgerEntryType.ADVANCE_RECEIVED,
+                createdAt: { gte: periodStart, lte: periodEnd },
+              },
+              select: { amount: true },
+            })
+            const advancesDeducted = parseFloat(
+              advanceEntries.reduce((s, e) => s + Number(e.amount), 0).toFixed(2),
+            )
+
+            // Ajustes manuales (ADJUSTMENT) del período — suman al neto
+            const adjustmentEntries = await tx.employeeLedgerEntry.findMany({
+              where: {
+                tenantId,
+                userId:    input.userId,
+                type:      LedgerEntryType.ADJUSTMENT,
+                createdAt: { gte: periodStart, lte: periodEnd },
+              },
+              select: { amount: true },
+            })
+            const otherAdjustments = parseFloat(
+              adjustmentEntries.reduce((s, e) => s + Number(e.amount), 0).toFixed(2),
+            )
+
+            // Comisiones manuales (COMMISSION_EARNED) del período — suman al neto
+            const manualCommissionEntries = await tx.employeeLedgerEntry.findMany({
+              where: {
+                tenantId,
+                userId:    input.userId,
+                type:      LedgerEntryType.COMMISSION_EARNED,
+                createdAt: { gte: periodStart, lte: periodEnd },
+              },
+              select: { amount: true },
+            })
+            const manualCommissions = parseFloat(
+              manualCommissionEntries.reduce((s, e) => s + Number(e.amount), 0).toFixed(2),
+            )
+
+            // Consumos de crédito sin aplicar a nómina
+            const creditResult = await tx.$queryRaw<Array<{ pending_debt: number }>>`
+              SELECT COALESCE(
+                SUM(CASE WHEN type = 'CREDIT_ISSUED' THEN amount ELSE 0 END) -
+                SUM(CASE WHEN type IN ('PAYMENT_RECEIVED','CREDIT_CANCELLED','DISCOUNT_APPLIED')
+                    THEN COALESCE("appliedAmount", amount) ELSE 0 END),
+                0
+              ) AS pending_debt
+              FROM "CreditTransaction"
+              WHERE "tenantId"             = ${tenantId}::uuid
+                AND "debtorUserId"         = ${input.userId}::uuid
+                AND "appliedToPayrollId"   IS NULL
+            `
+            const creditConsumptions = parseFloat(
+              Number(creditResult[0]?.pending_debt ?? 0).toFixed(2),
+            )
+
+            // Fórmula idéntica a calculatePayroll — nunca pueden divergir
+            const netPayment = parseFloat(
+              (baseSalary + commissionsEarned + manualCommissions + otherAdjustments - advancesDeducted - creditConsumptions).toFixed(2),
+            )
+
+            // ¿Hay transferencias pendientes en el período que afecten comisiones?
+            const pendingTransferCount = await tx.order.count({
+              where: {
+                tenantId,
+                createdByUserId: input.userId,
+                status:          'PAID_TRANSFER_PENDING',
+                createdAt:       { gte: periodStart, lte: periodEnd },
+              },
+            })
+            // hasPendingAdjustments = TRUE si hay PAID_TRANSFER_PENDING
+            // (Corregido respecto al prompt de Gemini — el flag se marca TRUE al cerrar
+            // y el Paso 7 lo pone en FALSE cuando confirma las transferencias)
+            const hasPendingAdjustments = pendingTransferCount > 0
+
+            const effectiveDevice = deviceId ?? (
+              await tx.device.findFirst({
+                where: { tenantId, establishmentId, isActive: true, deletedAt: null },
+                select: { id: true },
+              }).then(d => d?.id)
+            )
+
+            if (!effectiveDevice) {
+              throw new TRPCError({
+                code:    'PRECONDITION_FAILED',
+                message: 'No hay dispositivos activos en este establecimiento',
+              })
+            }
+
+            // 4. Crear EmployeeLedgerEntry(SALARY_PAYMENT)
+            //    OBLIGATORIO: PayrollRecord.ledgerEntryId @unique requiere este registro
+            const salaryLedgerEntry = await tx.employeeLedgerEntry.create({
               data: {
                 tenantId,
                 establishmentId,
+                userId:       input.userId,
+                type:         LedgerEntryType.SALARY_PAYMENT,
+                amount:       netPayment,
                 businessDayId,
-                type:    CashEventType.CASH_OUT_ADJUSTMENT,
-                amount:  netPayment,
-                userId:  adminId!,
-                deviceId: effectiveDevice,
-                notes:   `Pago de nómina | ${payrollRecord.id}`,
+                authorizedBy: adminId!,
+                deviceId:     effectiveDevice,
+                notes:        input.notes
+                  ? `Cierre de nómina | ${input.notes}`
+                  : `Cierre de nómina ${periodStart.toISOString().split('T')[0]} → ${periodEnd.toISOString().split('T')[0]}`,
               },
             })
-            cashEventId = cashEvent.id
-          }
 
-          return { payrollRecord, salaryLedgerEntry, cashEventId, hasPendingAdjustments }
-        },
-        { timeout: 20_000 },
-      )
+            // 5. Crear PayrollRecord (snapshot inmutable — sin updatedAt)
+            //    BUG 2: el UNIQUE INDEX en BD atrapa doble cierre concurrente.
+            //    El catch P2002 en el wrapper convierte la violación en error claro.
+            const payrollRecord = await tx.payrollRecord.create({
+              data: {
+                tenantId,
+                userId:               input.userId,
+                contractSnapshotId:   contract.id,
+                periodStart,
+                periodEnd,
+                workedDaysOrShifts:   input.workedDaysOrShifts ?? null,
+                baseSalary,
+                commissionableAmount,
+                commissionRate,
+                commissionsEarned,
+                advancesDeducted,
+                creditConsumptions,
+                netPayment,
+                paymentMethod:        input.paymentMethod,
+                receiptUrl:           input.receiptUrl ?? null,
+                hasPendingAdjustments,
+                paidBy:               adminId!,
+                paidAt:               new Date(),
+                notes:                input.notes ?? null,
+                ledgerEntryId:        salaryLedgerEntry.id,
+              },
+            })
+
+            // 6. Si pago en efectivo: CashRegisterEvent(CASH_OUT_ADJUSTMENT)
+            //    BUG 3 corregido: referencia cruzada bidireccional idéntica al patrón
+            //    de addLedgerEntry(ADVANCE_RECEIVED).
+            //    Paso 1: crear evento de caja → obtener id
+            //    Paso 2: $executeRaw para cerrar la FK circular
+            //    (CashRegisterEvent.employeeLedgerEntryId es plain UUID sin @relation)
+            let cashEventId: string | null = null
+            if (input.paymentMethod === 'CASH') {
+              const cashEvent = await tx.cashRegisterEvent.create({
+                data: {
+                  tenantId,
+                  establishmentId,
+                  businessDayId,
+                  type:    CashEventType.CASH_OUT_ADJUSTMENT,
+                  amount:  netPayment,
+                  userId:  adminId!,
+                  deviceId: effectiveDevice,
+                  notes:   `Pago de nómina | ${payrollRecord.id}`,
+                  // employeeLedgerEntryId se actualiza después (FK circular — ver schema)
+                },
+              })
+              cashEventId = cashEvent.id
+
+              // Cerrar la referencia inversa: CashRegisterEvent → EmployeeLedgerEntry
+              // Patrón idéntico a addLedgerEntry para mantener trazabilidad bidireccional
+              await tx.$executeRaw`
+                UPDATE "CashRegisterEvent"
+                SET "employeeLedgerEntryId" = ${salaryLedgerEntry.id}::uuid
+                WHERE id = ${cashEventId}::uuid
+              `
+            }
+
+            return { payrollRecord, salaryLedgerEntry, cashEventId, hasPendingAdjustments }
+          },
+          { timeout: 20_000 },
+        )
+      } catch (err: unknown) {
+        // P2002 = Unique constraint violation de Prisma
+        // El UNIQUE INDEX en (tenantId, userId, periodStart, periodEnd) protege
+        // contra doble cierre concurrente del mismo período.
+        if (
+          err instanceof Error &&
+          'code' in err &&
+          (err as { code: string }).code === 'P2002'
+        ) {
+          throw new TRPCError({
+            code:    'CONFLICT',
+            message: 'Ya existe una liquidación de nómina para este empleado en el período indicado. No se puede cerrar dos veces el mismo período.',
+            cause:   err,
+          })
+        }
+        throw err
+      }
 
       return {
         payrollRecordId:      result.payrollRecord.id,
