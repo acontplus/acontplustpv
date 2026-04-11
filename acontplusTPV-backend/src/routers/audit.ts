@@ -1,4 +1,5 @@
 // =============================================================================
+// =============================================================================
 // apps/api/src/routers/audit.ts
 // Arqueo de Inventario (Auditoría Física) — Paso 11
 //
@@ -36,6 +37,7 @@ import { adminProcedure }         from '../middleware/auth'
 import { withOpenDay }            from '../middleware/businessDay'
 import { withTenant, withTenantOptions } from '../lib/rls'
 import { MovementType, AuditStatus }     from '@prisma/client'
+import { Prisma, AuditStatus, MovementType } from '@prisma/client'
 
 // =============================================================================
 // SCHEMAS
@@ -174,10 +176,9 @@ export const auditRouter = router({
         // INSERT concurrente con P2002 antes de que llegue a crear un duplicado.
         // Convertimos el error crudo de Prisma en una respuesta CONFLICT limpia.
         if (
-          err instanceof Error &&
-          'code' in err &&
-          (err as { code: string }).code === 'P2002'
-        ) {
+			err instanceof Prisma.PrismaClientKnownRequestError &&
+			err.code === 'P2002'
+		  ) {
           throw new TRPCError({
             code:    'CONFLICT',
             message: 'Ya existe una auditoría en progreso para esta bodega. Ciérrala antes de iniciar una nueva.',
