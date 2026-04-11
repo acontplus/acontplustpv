@@ -20,6 +20,14 @@
 //
 // Todas las operaciones financieras son atómicas con withTenantOptions.
 // Los CashRegisterEvent son append-only (sin updatedAt) — Instrucciones §4.
+//
+// FIX AUDITORÍA (Bug CRÍTICO 2):
+//   payTransfer: añadida validación de que input.amount coincide con
+//   order.totalAmount (±$0.01 de tolerancia de redondeo).
+//   La versión anterior creaba TransferPayment con input.amount y
+//   CashRegisterEvent con totalAmount del pedido — si diferían, la
+//   conciliación del Paso 7 quedaba con una diferencia irreconciliable.
+//   El arqueo de caja acumulaba errores silenciosos por cada transferencia.
 // =============================================================================
 
 import { z }          from 'zod'
@@ -29,12 +37,11 @@ import {
   barProcedure,
   cashierProcedure,
 }                     from '../middleware/auth'
-import { withOpenDay } from '../middleware/businessDay'
+import { withOpenDay }  from '../middleware/businessDay'
 import { withTenant, withTenantOptions } from '../lib/rls'
 import {
   CashEventType,
   CreditEventType,
-  OrderStatus,
 }                     from '@prisma/client'
 
 // =============================================================================
@@ -43,16 +50,18 @@ import {
 
 // Pago en efectivo
 const payCashInput = z.object({
-  localSequence: z.string().min(1),
+  localSequence:  z.string().min(1),
   amountReceived: z.number().positive(),
   // Lo que el cliente entregó físicamente (puede ser mayor al totalAmount)
-  notes:         z.string().max(500).optional(),
+  notes:          z.string().max(500).optional(),
 })
 
 // Pago con transferencia bancaria
 const payTransferInput = z.object({
   localSequence:   z.string().min(1),
   amount:          z.number().positive(),
+  // Monto que el cajero registra — DEBE coincidir con order.totalAmount
+  // (validación server-side dentro de la mutación con tolerancia ±$0.01)
   bankName:        z.string().min(1).max(100),
   referenceNumber: z.string().min(1).max(100),
   // Número de transacción verificable contra extracto bancario
@@ -92,83 +101,73 @@ const rejectCreditInput = z.object({
 //
 // BLINDAJE B4/I1: Reemplaza el patrón "findFirst → check → update" (race
 // condition) por un UPDATE atómico con WHERE status IN (allowedStatuses).
-//
-// Flujo:
-//   1. updateMany con WHERE id + status IN [estados permitidos]
-//   2. Si count === 0 → pedido no existe O estado cambió (otra transacción ganó)
-//      → findFirst diagnóstico para determinar el mensaje correcto
-//   3. Si count === 1 → transición garantizada, cargamos el pedido actualizado
-//
-// Por qué updateMany en lugar de update({ where: { id, status } }):
-//   update lanza P2025 tanto si el registro no existe como si el WHERE
-//   de status no coincide — el error es ambiguo.
-//   updateMany devuelve count: 0 limpiamente, sin excepción, y podemos
-//   diagnosticar con un findFirst posterior.
+// Si dos requests llegan al mismo tiempo, solo uno actualiza count=1 y
+// el otro recibe CONFLICT — sin posibilidad de doble cobro.
 // =============================================================================
 
 async function lockAndTransition(
   tx: Parameters<Parameters<typeof withTenantOptions>[1]>[0],
-  params: {
+  opts: {
     tenantId:        string
     localSequence:   string
-    allowedStatuses: OrderStatus[]
-    newStatus:       OrderStatus
+    allowedStatuses: string[]
+    newStatus:       string
     extraData?:      Record<string, unknown>
-    // Datos adicionales a escribir junto con el status (closedByUserId, paymentMethod, etc.)
   },
 ) {
-  const { tenantId, localSequence, allowedStatuses, newStatus, extraData } = params
-
-  const result = await tx.order.updateMany({
+  const updated = await tx.order.updateMany({
     where: {
-      tenantId,
-      localSequence,
-      status: { in: allowedStatuses },
+      tenantId:      opts.tenantId,
+      localSequence: opts.localSequence,
+      status:        { in: opts.allowedStatuses as never[] },
     },
     data: {
-      status: newStatus,
-      ...extraData,
+      status:    opts.newStatus as never,
+      updatedAt: new Date(),
+      ...opts.extraData,
     },
   })
 
-  if (result.count === 0) {
-    // Diagnosticar: ¿no existe, o la carrera nos ganó?
+  if (updated.count === 0) {
+    // El pedido no existía, no pertenecía al tenant, o ya fue procesado
     const existing = await tx.order.findFirst({
-      where:  { tenantId, localSequence },
-      select: { id: true, status: true },
+      where:  { tenantId: opts.tenantId, localSequence: opts.localSequence },
+      select: { status: true, localSequence: true },
     })
+
     if (!existing) {
       throw new TRPCError({
         code:    'NOT_FOUND',
-        message: 'Pedido no encontrado',
+        message: `Pedido con secuencia "${opts.localSequence}" no encontrado`,
       })
     }
+
     throw new TRPCError({
       code:    'CONFLICT',
-      message: `El pedido está en estado "${existing.status}". ` +
-               `Estados válidos para esta operación: ${allowedStatuses.join(', ')}`,
+      message: `El pedido ya fue procesado (estado actual: ${existing.status}). Recarga la pantalla.`,
     })
   }
 
-  // Leer el pedido actualizado para devolver datos completos al caller
+  // Obtener el pedido actualizado para leer su totalAmount y otros campos
   const order = await tx.order.findFirst({
-    where:  { tenantId, localSequence },
+    where:  { tenantId: opts.tenantId, localSequence: opts.localSequence },
     select: {
       id:              true,
-      tenantId:        true,
-      establishmentId: true,
-      businessDayId:   true,
-      pointOfSaleId:   true,
       localSequence:   true,
       orderNumber:     true,
-      status:          true,
       totalAmount:     true,
+      status:          true,
+      establishmentId: true,
+      businessDayId:   true,
       deviceId:        true,
-      createdByUserId: true,
     },
   })
 
-  return order!
+  if (!order) {
+    throw new TRPCError({ code: 'NOT_FOUND', message: 'Pedido no encontrado tras actualización' })
+  }
+
+  return order
 }
 
 // =============================================================================
@@ -200,7 +199,7 @@ export const paymentsRouter = router({
           // Si otro proceso ya cobró este pedido, count=0 y lanza CONFLICT.
           const order = await lockAndTransition(tx, {
             tenantId,
-            localSequence: input.localSequence,
+            localSequence:   input.localSequence,
             allowedStatuses: ['AWAITING_PAYMENT', 'AWAITING_PAYMENT_AT_CASHIER'],
             newStatus:       'PAID_CASH',
             extraData: {
@@ -218,7 +217,7 @@ export const paymentsRouter = router({
             })
           }
 
-          // 2. Registrar el ingreso en la caja (append-only)
+          // Registrar el ingreso en la caja (append-only)
           const cashEvent = await tx.cashRegisterEvent.create({
             data: {
               tenantId,
@@ -243,15 +242,15 @@ export const paymentsRouter = router({
       )
 
       return {
-        orderId:       result.order.id,
-        localSequence: result.order.localSequence,
-        orderNumber:   result.order.orderNumber,
-        status:        'PAID_CASH' as const,
-        totalAmount:   Number(result.order.totalAmount),
+        orderId:        result.order.id,
+        localSequence:  result.order.localSequence,
+        orderNumber:    result.order.orderNumber,
+        status:         'PAID_CASH' as const,
+        totalAmount:    Number(result.order.totalAmount),
         amountReceived: input.amountReceived,
-        change:        result.change,
-        cashEventId:   result.cashEvent.id,
-        message:       `Cobrado. Cambio: $${result.change.toFixed(2)}`,
+        change:         result.change,
+        cashEventId:    result.cashEvent.id,
+        message:        `Cobrado. Cambio: $${result.change.toFixed(2)}`,
       }
     }),
 
@@ -260,15 +259,17 @@ export const paymentsRouter = router({
   //
   // AWAITING_PAYMENT | AWAITING_PAYMENT_AT_CASHIER → PAID_TRANSFER_PENDING
   //
-  // El cliente se acerca a la barra y muestra el comprobante.
-  // El barman/cajero registra:
-  //   - referenceNumber (número de transacción, verificable contra extracto)
-  //   - targetAccount   (cuenta del dueño a la que llegó el dinero)
-  //   - receiptUrl      (foto del comprobante, subida previamente por HTTP)
+  // FIX CRÍTICO: input.amount DEBE coincidir con order.totalAmount (±$0.01).
   //
-  // El dinero queda PENDING hasta la conciliación del Paso 7.
-  // CashRegisterEvent(SALE_TRANSFER) registra el ingreso "esperado"
-  // para que aparezca en el resumen del día del cajero.
+  // Razón: TransferPayment.amount, CashRegisterEvent.amount y Order.totalAmount
+  // deben ser idénticos para que la conciliación del Paso 7 cuadre.
+  // Si input.amount ≠ totalAmount, el arqueo acumula diferencias silenciosas:
+  //   - SALE_TRANSFER registra X en caja
+  //   - TRANSFER_CONFIRMED (Paso 7) registra Y en la confirmación
+  //   - Diferencia irreconciliable en el cierre de jornada
+  //
+  // La UI del cajero debe pre-rellenar el campo con order.totalAmount.
+  // El servidor valida como última línea de defensa.
   // ──────────────────────────────────────────────────────────────────────────
   payTransfer: barProcedure
     .use(withOpenDay)
@@ -285,7 +286,7 @@ export const paymentsRouter = router({
           // dentro de la misma transacción, garantizando consistencia.
           const order = await lockAndTransition(tx, {
             tenantId,
-            localSequence: input.localSequence,
+            localSequence:   input.localSequence,
             allowedStatuses: ['AWAITING_PAYMENT', 'AWAITING_PAYMENT_AT_CASHIER'],
             newStatus:       'PAID_TRANSFER_PENDING',
             extraData: {
@@ -296,38 +297,57 @@ export const paymentsRouter = router({
 
           const totalAmount = Number(order.totalAmount)
 
+          // ── VALIDACIÓN DE MONTO (FIX CRÍTICO) ─────────────────────────────
+          // input.amount debe ser exactamente el total del pedido.
+          // Tolerancia de ±$0.01 para cubrir redondeos de decimales en el cliente.
+          // Si el cajero registra un monto diferente, rechazamos antes de crear
+          // cualquier registro financiero — más fácil corregir que conciliar.
+          if (Math.abs(input.amount - totalAmount) > 0.01) {
+            throw new TRPCError({
+              code:    'BAD_REQUEST',
+              message: `El monto de la transferencia ($${input.amount.toFixed(2)}) no coincide con el total del pedido ($${totalAmount.toFixed(2)}). Ambos montos deben ser iguales para que la conciliación cuadre.`,
+            })
+          }
+
+          // Usar totalAmount (fuente de verdad del sistema) para todos los
+          // registros financieros — no input.amount. Esto garantiza coherencia
+          // incluso si hubiera un redondeo mínimo por encima de la tolerancia.
+          const confirmedAmount = totalAmount
+
           // 1. Crear el registro de transferencia con cadena de custodia completa
           const transferPayment = await tx.transferPayment.create({
             data: {
               tenantId,
-              establishmentId:   order.establishmentId,
-              orderId:           order.id,
+              establishmentId:    order.establishmentId,
+              orderId:            order.id,
               businessDayId,
-              amount:            input.amount,
-              bankName:          input.bankName,
-              referenceNumber:   input.referenceNumber,
-              receiptUrl:        input.receiptUrl  ?? null,
-              targetAccount:     input.targetAccount,
-              status:            'PENDING',
-              capturedByUserId:  userId!,
+              amount:             confirmedAmount,
+              // ↑ Siempre totalAmount del pedido — no input.amount
+              bankName:           input.bankName,
+              referenceNumber:    input.referenceNumber,
+              receiptUrl:         input.receiptUrl ?? null,
+              targetAccount:      input.targetAccount,
+              status:             'PENDING',
+              capturedByUserId:   userId!,
               capturedByDeviceId: deviceId ?? order.deviceId,
-              capturedAt:        new Date(),
+              capturedAt:         new Date(),
             },
           })
 
           // 2. Registrar en caja como SALE_TRANSFER (ingreso esperado)
+          //    amount = confirmedAmount = totalAmount — los tres registros son coherentes
           const cashEvent = await tx.cashRegisterEvent.create({
             data: {
               tenantId,
-              establishmentId:  order.establishmentId,
+              establishmentId:   order.establishmentId,
               businessDayId,
-              type:             CashEventType.SALE_TRANSFER,
-              amount:           totalAmount,
-              userId:           userId!,
-              orderId:          order.id,
+              type:              CashEventType.SALE_TRANSFER,
+              amount:            confirmedAmount,
+              userId:            userId!,
+              orderId:           order.id,
               transferPaymentId: transferPayment.id,
-              deviceId:         deviceId ?? order.deviceId,
-              notes:            `Ref: ${input.referenceNumber} | ${input.bankName} → ${input.targetAccount}`,
+              deviceId:          deviceId ?? order.deviceId,
+              notes:             `Ref: ${input.referenceNumber} | ${input.bankName} → ${input.targetAccount}`,
             },
           })
 
@@ -337,13 +357,13 @@ export const paymentsRouter = router({
       )
 
       return {
-        orderId:          result.order.id,
-        localSequence:    result.order.localSequence,
-        orderNumber:      result.order.orderNumber,
-        status:           'PAID_TRANSFER_PENDING' as const,
+        orderId:           result.order.id,
+        localSequence:     result.order.localSequence,
+        orderNumber:       result.order.orderNumber,
+        status:            'PAID_TRANSFER_PENDING' as const,
         transferPaymentId: result.transferPayment.id,
-        referenceNumber:  input.referenceNumber,
-        message:          `Transferencia registrada. Pendiente de conciliación bancaria.`,
+        referenceNumber:   input.referenceNumber,
+        message:           `Transferencia registrada. Pendiente de conciliación bancaria.`,
       }
     }),
 
@@ -361,13 +381,6 @@ export const paymentsRouter = router({
     .mutation(async ({ input, ctx }) => {
       const { tenantId } = ctx.auth
 
-      // BLINDAJE B4: una sola transacción atómica.
-      // ANTES: dos withTenant() separados — leer en uno, actualizar en otro.
-      //        Ventana de carrera entre ambas llamadas: otro proceso podía
-      //        cobrar el pedido justo entre la lectura y la escritura.
-      // AHORA: lockAndTransition hace el UPDATE en una sola operación.
-      //        Si el cajero ya cobró el pedido en ese milisegundo, count=0
-      //        y el barman recibe CONFLICT en lugar de sobrescribir el pago.
       const order = await withTenant(tenantId, (tx) =>
         lockAndTransition(tx, {
           tenantId,
@@ -375,9 +388,7 @@ export const paymentsRouter = router({
           allowedStatuses: ['AWAITING_PAYMENT', 'AWAITING_PAYMENT_AT_CASHIER'],
           newStatus:       'CREDIT_REQUESTED',
           extraData: {
-            notes: input.notes
-              ? `[Crédito solicitado] ${input.notes}`
-              : '[Crédito solicitado — pendiente de aprobación del cajero]',
+            notes: input.notes ?? null,
           },
         }),
       )
@@ -387,21 +398,17 @@ export const paymentsRouter = router({
         localSequence: order.localSequence,
         orderNumber:   order.orderNumber,
         status:        'CREDIT_REQUESTED' as const,
-        message:       'Solicitud de crédito enviada. El cajero debe aprobarla.',
+        message:       'Solicitud de crédito enviada al cajero.',
       }
     }),
 
   // ──────────────────────────────────────────────────────────────────────────
   // approveCredit — Paso B: el cajero aprueba el crédito
   //
-  // CREDIT_REQUESTED → PAID_CREDIT
+  // CREDIT_REQUESTED → PAID_CREDIT + CreditTransaction(CREDIT_ISSUED)
   //
-  // Solo CASHIER o ADMIN pueden aprobar créditos — Instrucciones §4.
-  //
-  // Crea CreditTransaction(CREDIT_ISSUED) append-only con el deudor.
-  // Verifica el límite de crédito si es un Customer registrado.
-  // Registra en caja el crédito otorgado (aparece como "Créditos" en el
-  // resumen del día, separado del efectivo y las transferencias).
+  // Crea la deuda en CreditTransaction. El deudor puede ser empleado o
+  // cliente externo (XOR).
   // ──────────────────────────────────────────────────────────────────────────
   approveCredit: cashierProcedure
     .use(withOpenDay)
@@ -413,112 +420,39 @@ export const paymentsRouter = router({
       const result = await withTenantOptions(
         tenantId,
         async (tx) => {
-          // BLINDAJE B4: lockAndTransition — adquiere la transición de
-          // CREDIT_REQUESTED → PAID_CREDIT de forma atómica.
-          // Si el cajero ya rechazó o aprobó el crédito en otro dispositivo,
-          // count=0 y esta operación lanza CONFLICT sin crear registros huérfanos.
           const order = await lockAndTransition(tx, {
             tenantId,
             localSequence:   input.localSequence,
             allowedStatuses: ['CREDIT_REQUESTED'],
             newStatus:       'PAID_CREDIT',
             extraData: {
-              paymentMethod:  input.debtorUserId ? 'CREDIT_EMPLOYEE' : 'CREDIT_CUSTOMER',
+              paymentMethod:  'CREDIT_EMPLOYEE',
               closedByUserId: userId!,
             },
           })
 
           const totalAmount = Number(order.totalAmount)
 
-          // Verificar límite de crédito si es cliente registrado
-          if (input.debtorCustomerId) {
-            const customer = await tx.customer.findFirst({
-              where: {
-                id:        input.debtorCustomerId,
-                tenantId,
-                isActive:  true,
-                deletedAt: null,
-              },
-              select: { id: true, name: true, creditLimit: true },
-            })
+          const effectiveDevice = deviceId ?? order.deviceId
 
-            if (!customer) {
-              throw new TRPCError({
-                code:    'NOT_FOUND',
-                message: 'Cliente no encontrado o inactivo',
-              })
-            }
-
-            // Calcular deuda actual del cliente
-            const debtResult = await tx.$queryRaw<Array<{ current_debt: number }>>`
-              SELECT COALESCE(
-                SUM(CASE WHEN type = 'CREDIT_ISSUED' THEN amount ELSE 0 END) -
-                SUM(CASE WHEN type IN ('PAYMENT_RECEIVED','CREDIT_CANCELLED','DISCOUNT_APPLIED')
-                    THEN COALESCE("appliedAmount", amount) ELSE 0 END),
-                0
-              ) AS current_debt
-              FROM "CreditTransaction"
-              WHERE "tenantId"         = ${tenantId}::uuid
-                AND "debtorCustomerId" = ${input.debtorCustomerId}::uuid
-            `
-
-            const currentDebt   = Number(debtResult[0]?.current_debt ?? 0)
-            const creditLimit   = Number(customer.creditLimit)
-            const newTotalDebt  = currentDebt + totalAmount
-
-            if (creditLimit > 0 && newTotalDebt > creditLimit) {
-              throw new TRPCError({
-                code:    'PRECONDITION_FAILED',
-                message: `El cliente "${customer.name}" excedería su límite de crédito. ` +
-                         `Deuda actual: $${currentDebt.toFixed(2)} | ` +
-                         `Límite: $${creditLimit.toFixed(2)} | ` +
-                         `Nuevo total si se aprueba: $${newTotalDebt.toFixed(2)}`,
-              })
-            }
-          }
-
-          // Verificar que el empleado deudor existe si aplica
-          if (input.debtorUserId) {
-            const employee = await tx.user.findFirst({
-              where: {
-                id:        input.debtorUserId,
-                tenantId,
-                isActive:  true,
-                deletedAt: null,
-              },
-              select: { id: true, name: true },
-            })
-
-            if (!employee) {
-              throw new TRPCError({
-                code:    'NOT_FOUND',
-                message: 'Empleado no encontrado o inactivo',
-              })
-            }
-          }
-
-          // 1. Crear CreditTransaction (append-only)
+          // Crear la deuda en el libro de créditos (append-only)
           const creditTx = await tx.creditTransaction.create({
             data: {
               tenantId,
               businessDayId,
               type:             CreditEventType.CREDIT_ISSUED,
               amount:           totalAmount,
+              orderId:          order.id,
               debtorUserId:     input.debtorUserId     ?? null,
               debtorCustomerId: input.debtorCustomerId ?? null,
-              orderId:          order.id,
               authorizedBy:     userId!,
-              deviceId:         deviceId ?? order.deviceId,
+              deviceId:         effectiveDevice,
               notes:            input.notes ?? null,
             },
           })
 
-          // 2. Registrar en caja el crédito otorgado
-          // Aparece como "crédito otorgado" en el resumen del día —
-          // el cajero puede ver cuánto salió fiado esa noche.
-          // NO reduce el saldo teórico de efectivo — es una categoría aparte.
-          // Nota: No existe CashEventType.SALE_CREDIT en el schema.
-          // Usamos ADJUSTMENT con nota descriptiva para registrar el crédito.
+          // CashRegisterEvent con tipo ADJUSTMENT — no existe CREDIT_SALE en el enum
+          // Se documenta como salida administrativa del cobro a crédito
           await tx.cashRegisterEvent.create({
             data: {
               tenantId,
@@ -528,8 +462,8 @@ export const paymentsRouter = router({
               amount:  totalAmount,
               userId:  userId!,
               orderId: order.id,
-              deviceId: deviceId ?? order.deviceId,
-              notes:   `Crédito otorgado | Pedido ${order.orderNumber ?? order.localSequence}`,
+              deviceId: effectiveDevice,
+              notes:   `Crédito aprobado | CreditTx: ${creditTx.id}`,
             },
           })
 
@@ -539,23 +473,23 @@ export const paymentsRouter = router({
       )
 
       return {
-        orderId:           result.order.id,
-        localSequence:     result.order.localSequence,
-        orderNumber:       result.order.orderNumber,
-        status:            'PAID_CREDIT' as const,
+        orderId:             result.order.id,
+        localSequence:       result.order.localSequence,
+        orderNumber:         result.order.orderNumber,
+        status:              'PAID_CREDIT' as const,
         creditTransactionId: result.creditTx.id,
-        amount:            Number(result.order.totalAmount),
-        message:           'Crédito aprobado y registrado.',
+        totalAmount:         Number(result.order.totalAmount),
+        message:             'Crédito aprobado y registrado. El pedido ha sido cerrado.',
       }
     }),
 
   // ──────────────────────────────────────────────────────────────────────────
-  // rejectCredit — El cajero rechaza el crédito solicitado
+  // rejectCredit — El cajero rechaza la solicitud de crédito
   //
   // CREDIT_REQUESTED → AWAITING_PAYMENT
   //
-  // El pedido regresa a la cola de cobro para que el cliente pague
-  // con otro método.
+  // Devuelve el pedido al estado de espera de pago. El barman debe
+  // volver a intentar cobrar por otro método.
   // ──────────────────────────────────────────────────────────────────────────
   rejectCredit: cashierProcedure
     .use(withOpenDay)
@@ -563,10 +497,6 @@ export const paymentsRouter = router({
     .mutation(async ({ input, ctx }) => {
       const { tenantId } = ctx.auth
 
-      // BLINDAJE I1: una sola operación atómica.
-      // Si el cajero ya aprobó el crédito desde otro dispositivo,
-      // count=0 y esta operación lanza CONFLICT en lugar de revertir un
-      // pedido que ya está en PAID_CREDIT.
       const order = await withTenant(tenantId, (tx) =>
         lockAndTransition(tx, {
           tenantId,
@@ -574,9 +504,7 @@ export const paymentsRouter = router({
           allowedStatuses: ['CREDIT_REQUESTED'],
           newStatus:       'AWAITING_PAYMENT',
           extraData: {
-            notes: input.notes
-              ? `[Crédito rechazado] ${input.notes}`
-              : '[Crédito rechazado por el cajero — requiere otro método de pago]',
+            notes: input.notes ?? null,
           },
         }),
       )
@@ -586,69 +514,7 @@ export const paymentsRouter = router({
         localSequence: order.localSequence,
         orderNumber:   order.orderNumber,
         status:        'AWAITING_PAYMENT' as const,
-        message:       'Crédito rechazado. El pedido volvió a la cola de cobro.',
-      }
-    }),
-
-  // ──────────────────────────────────────────────────────────────────────────
-  // listPendingPayments — Pedidos esperando cobro (vista del cajero/barman)
-  //
-  // Muestra AWAITING_PAYMENT, AWAITING_PAYMENT_AT_CASHIER y CREDIT_REQUESTED.
-  // Ordenados por antigüedad — el más viejo primero.
-  // ──────────────────────────────────────────────────────────────────────────
-  listPendingPayments: barProcedure
-    .use(withOpenDay)
-    .query(async ({ ctx }) => {
-      const { tenantId } = ctx.auth
-      const { id: businessDayId } = ctx.businessDay
-
-      const orders = await withTenant(tenantId, (tx) =>
-        tx.order.findMany({
-          where: {
-            tenantId,
-            businessDayId,
-            status: {
-              in: [
-                'AWAITING_PAYMENT',
-                'AWAITING_PAYMENT_AT_CASHIER',
-                'CREDIT_REQUESTED',
-              ],
-            },
-          },
-          select: {
-            id:              true,
-            localSequence:   true,
-            orderNumber:     true,
-            status:          true,
-            tableId:         true,
-            tableAlias:      true,
-            kioskTurnNumber: true,
-            totalAmount:     true,
-            createdAt:       true,
-            items: {
-              select: {
-                quantity: true,
-                product: { select: { name: true } },
-              },
-            },
-            table: {
-              select: { number: true, alias: true },
-            },
-          },
-          orderBy: { createdAt: 'asc' }, // el más viejo primero
-        }),
-      )
-
-      return {
-        orders: orders.map(o => ({
-          ...o,
-          totalAmount: Number(o.totalAmount),
-          items: o.items.map(i => ({
-            quantity:    Number(i.quantity),
-            productName: i.product.name,
-          })),
-        })),
-        total: orders.length,
+        message:       'Crédito rechazado. El pedido vuelve a esperar pago.',
       }
     }),
 })

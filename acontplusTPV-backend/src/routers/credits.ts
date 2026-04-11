@@ -23,10 +23,18 @@
 // Corrección al prompt de Gemini:
 //   El evento de caja para abono en efectivo es CREDIT_PAYMENT_RECEIVED,
 //   no "CASH_IN" — ese tipo no existe en el schema CashEventType.
+//
+// FIX AUDITORÍA (Bug CRÍTICO 1):
+//   listDebtors reescrito con Prisma.sql condicional.
+//   La versión anterior interpolaba tx.$queryRaw`` (que devuelve Promise)
+//   dentro de otro template $queryRaw — producía SQL con "[object Promise]"
+//   en lugar del fragmento SQL esperado, rompiendo el filtro por tipo
+//   de deudor y el HAVING de saldo silenciosamente.
 // =============================================================================
 
 import { z }          from 'zod'
 import { TRPCError }  from '@trpc/server'
+import { Prisma }     from '@prisma/client'
 import { router }     from '../trpc'
 import { cashierProcedure, adminProcedure } from '../middleware/auth'
 import { withOpenDay }  from '../middleware/businessDay'
@@ -48,7 +56,7 @@ const debtorSchema = z.union([
 // =============================================================================
 
 const listDebtorsInput = z.object({
-  type:           z.enum(['customer', 'employee', 'all']).default('all'),
+  type:            z.enum(['customer', 'employee', 'all']).default('all'),
   onlyWithBalance: z.boolean().default(true),
   // Si true, omite deudores con saldo = 0
 })
@@ -110,18 +118,18 @@ async function calculateBalance(
   tenantId: string,
   filter: { debtorUserId?: string; debtorCustomerId?: string },
 ): Promise<{
-  totalIssued:   number
-  totalReduced:  number
+  totalIssued:    number
+  totalReduced:   number
   currentBalance: number
-  transactions:  Array<{
-    id:              string
-    type:            CreditEventType
-    amount:          number
-    appliedAmount:   number | null
+  transactions:   Array<{
+    id:               string
+    type:             CreditEventType
+    amount:           number
+    appliedAmount:    number | null
     originalCreditId: string | null
-    orderId:         string | null
-    notes:           string | null
-    createdAt:       Date
+    orderId:          string | null
+    notes:            string | null
+    createdAt:        Date
   }>
 }> {
   const transactions = await tx.creditTransaction.findMany({
@@ -162,7 +170,7 @@ async function calculateBalance(
     currentBalance: parseFloat((totalIssued - totalReduced).toFixed(2)),
     transactions:   transactions.map(t => ({
       ...t,
-      amount:       Number(t.amount),
+      amount:        Number(t.amount),
       appliedAmount: t.appliedAmount ? Number(t.appliedAmount) : null,
     })),
   }
@@ -177,43 +185,68 @@ export const creditsRouter = router({
   // ──────────────────────────────────────────────────────────────────────────
   // listDebtors — Lista todos los deudores con su saldo actual
   //
-  // Calcula el saldo de cada deudor en tiempo de consulta sumando eventos.
-  // El parámetro onlyWithBalance=true omite los que ya saldaron su deuda.
+  // FIX CRÍTICO: reescrito con Prisma.sql para fragmentos condicionales.
+  //
+  // La versión anterior interpolaba tx.$queryRaw`` dentro del template SQL
+  // principal. tx.$queryRaw devuelve Promise<T[]>, no un fragmento SQL —
+  // el resultado era literalmente "[object Promise]" en el WHERE/HAVING,
+  // lo que rompía el filtro de tipo y la condición de saldo silenciosamente.
+  //
+  // La solución correcta es Prisma.sql con variables sql`` para fragmentos
+  // SQL seguros e inyección de parámetros con Prisma.raw para literales
+  // booleanos/numéricos que no son parámetros de usuario.
   // ──────────────────────────────────────────────────────────────────────────
   listDebtors: cashierProcedure
     .input(listDebtorsInput)
     .query(async ({ input, ctx }) => {
       const { tenantId } = ctx.auth
 
-      // Obtener todos los créditos del tenant agrupados por deudor
+      // Construir fragmentos SQL condicionales con Prisma.sql — type-safe y
+      // sin interpolación de Promises. Prisma.sql`` produce un objeto
+      // PrismaPromise<Sql> que se puede anidar de forma segura dentro de
+      // otro Prisma.sql`` template.
+      const typeFilter: Prisma.Sql =
+        input.type === 'customer' ? Prisma.sql`AND "debtorCustomerId" IS NOT NULL`
+        : input.type === 'employee' ? Prisma.sql`AND "debtorUserId"     IS NOT NULL`
+        : Prisma.sql``
+        // 'all' → sin filtro adicional
+
+      // Fragmento HAVING: si onlyWithBalance=true filtramos saldo > 0;
+      // si false retornamos todos los grupos (incluye saldo = 0)
+      const havingFilter: Prisma.Sql = input.onlyWithBalance
+        ? Prisma.sql`
+            SUM(CASE WHEN type = 'CREDIT_ISSUED' THEN amount ELSE 0 END) -
+            SUM(CASE WHEN type IN ('PAYMENT_RECEIVED','CREDIT_CANCELLED','DISCOUNT_APPLIED')
+                THEN COALESCE("appliedAmount", amount) ELSE 0 END) > 0`
+        : Prisma.sql`TRUE`
+
+      // Query principal: Prisma.sql garantiza parametrización segura de
+      // tenantId y composición correcta de los fragmentos condicionales.
       const rawBalances = await withTenant(tenantId, (tx) =>
         tx.$queryRaw<Array<{
           debtor_user_id:     string | null
           debtor_customer_id: string | null
           total_issued:       number
           total_reduced:      number
-        }>>`
+        }>>(Prisma.sql`
           SELECT
             "debtorUserId"     AS debtor_user_id,
             "debtorCustomerId" AS debtor_customer_id,
             SUM(CASE WHEN type = 'CREDIT_ISSUED'
-                THEN amount ELSE 0 END)                          AS total_issued,
+                THEN amount ELSE 0 END)                            AS total_issued,
             SUM(CASE WHEN type IN ('PAYMENT_RECEIVED','CREDIT_CANCELLED','DISCOUNT_APPLIED')
                 THEN COALESCE("appliedAmount", amount) ELSE 0 END) AS total_reduced
           FROM "CreditTransaction"
           WHERE "tenantId" = ${tenantId}::uuid
-            ${input.type === 'customer' ? tx.$queryRaw`AND "debtorCustomerId" IS NOT NULL` : tx.$queryRaw``}
-            ${input.type === 'employee' ? tx.$queryRaw`AND "debtorUserId" IS NOT NULL`     : tx.$queryRaw``}
+            ${typeFilter}
           GROUP BY "debtorUserId", "debtorCustomerId"
-          HAVING ${input.onlyWithBalance
-            ? tx.$queryRaw`SUM(CASE WHEN type = 'CREDIT_ISSUED' THEN amount ELSE 0 END) -
-              SUM(CASE WHEN type IN ('PAYMENT_RECEIVED','CREDIT_CANCELLED','DISCOUNT_APPLIED')
-              THEN COALESCE("appliedAmount", amount) ELSE 0 END) > 0`
-            : tx.$queryRaw`TRUE`}
-          ORDER BY (SUM(CASE WHEN type = 'CREDIT_ISSUED' THEN amount ELSE 0 END) -
-                    SUM(CASE WHEN type IN ('PAYMENT_RECEIVED','CREDIT_CANCELLED','DISCOUNT_APPLIED')
-                    THEN COALESCE("appliedAmount", amount) ELSE 0 END)) DESC
-        `,
+          HAVING ${havingFilter}
+          ORDER BY (
+            SUM(CASE WHEN type = 'CREDIT_ISSUED' THEN amount ELSE 0 END) -
+            SUM(CASE WHEN type IN ('PAYMENT_RECEIVED','CREDIT_CANCELLED','DISCOUNT_APPLIED')
+                THEN COALESCE("appliedAmount", amount) ELSE 0 END)
+          ) DESC
+        `),
       )
 
       // Resolver nombres de usuarios y clientes
@@ -318,12 +351,12 @@ export const creditsRouter = router({
 
       return {
         debtorName,
-        debtorId:      input.debtorUserId ?? input.debtorCustomerId!,
-        debtorType:    input.debtorUserId ? 'employee' : 'customer',
+        debtorId:       input.debtorUserId ?? input.debtorCustomerId!,
+        debtorType:     input.debtorUserId ? 'employee' : 'customer',
         currentBalance: balance.currentBalance,
-        totalIssued:   balance.totalIssued,
-        totalReduced:  balance.totalReduced,
-        transactions:  balance.transactions,
+        totalIssued:    balance.totalIssued,
+        totalReduced:   balance.totalReduced,
+        transactions:   balance.transactions,
       }
     }),
 
@@ -376,8 +409,8 @@ export const creditsRouter = router({
 
           const effectiveDevice = deviceId ?? (
             await tx.device.findFirst({
-              where: { tenantId, establishmentId, isActive: true, deletedAt: null },
-              select: { id: true },
+              where:   { tenantId, establishmentId, isActive: true, deletedAt: null },
+              select:  { id: true },
               orderBy: { createdAt: 'asc' },
             })
           )?.id
@@ -431,23 +464,20 @@ export const creditsRouter = router({
             data: {
               tenantId,
               establishmentId,
-              orderId:           creditTx.id,
+              orderId:            creditTx.id,
               // Usamos creditTx.id como orderId — el schema tiene orderId nullable
               // y aquí se usa para relacionar el TransferPayment con el pago de deuda
-              // NOTA: esto requiere que orderId en TransferPayment sea una referencia
-              // flexible. Si se necesita FK estricta, se puede usar un campo adicional
-              // en futuras versiones. Por ahora la referencia cruzada es suficiente.
               businessDayId,
-              amount:            input.amount,
-              bankName:          input.bankName!,
-              referenceNumber:   input.referenceNumber!,
-              receiptUrl:        input.receiptUrl ?? null,
-              targetAccount:     input.targetAccount!,
-              status:            'PENDING',
-              capturedByUserId:  userId!,
+              amount:             input.amount,
+              bankName:           input.bankName!,
+              referenceNumber:    input.referenceNumber!,
+              receiptUrl:         input.receiptUrl ?? null,
+              targetAccount:      input.targetAccount!,
+              status:             'PENDING',
+              capturedByUserId:   userId!,
               capturedByDeviceId: effectiveDevice,
-              capturedAt:        new Date(),
-              notes:             input.notes ?? null,
+              capturedAt:         new Date(),
+              notes:              input.notes ?? null,
             },
           })
 
@@ -493,7 +523,7 @@ export const creditsRouter = router({
   applyDiscount: adminProcedure
     .input(applyDiscountInput)
     .mutation(async ({ input, ctx }) => {
-      const { tenantId, userId, deviceId, establishmentId } = ctx.auth
+      const { tenantId, userId, deviceId } = ctx.auth
 
       const result = await withTenantOptions(
         tenantId,
@@ -524,7 +554,7 @@ export const creditsRouter = router({
 
           // Verificar que el PayrollRecord existe
           const payroll = await tx.payrollRecord.findFirst({
-            where: { id: input.appliedToPayrollId, tenantId },
+            where:  { id: input.appliedToPayrollId, tenantId },
             select: { id: true },
           })
 
@@ -561,19 +591,19 @@ export const creditsRouter = router({
           const discountTx = await tx.creditTransaction.create({
             data: {
               tenantId,
-              businessDayId:     originalCredit.businessDayId,
-              type:              CreditEventType.DISCOUNT_APPLIED,
-              amount:            originalAmount,
+              businessDayId:      originalCredit.businessDayId,
+              type:               CreditEventType.DISCOUNT_APPLIED,
+              amount:             originalAmount,
               // amount = monto total del crédito original (para trazabilidad)
-              appliedAmount:     input.appliedAmount,
+              appliedAmount:      input.appliedAmount,
               // appliedAmount = lo que realmente se descuenta esta vez
               appliedToPayrollId: input.appliedToPayrollId,
-              originalCreditId:  input.originalCreditId,
-              debtorUserId:      originalCredit.debtorUserId,
-              debtorCustomerId:  originalCredit.debtorCustomerId,
-              authorizedBy:      userId!,
-              deviceId:          effectiveDevice,
-              notes:             input.notes ?? null,
+              originalCreditId:   input.originalCreditId,
+              debtorUserId:       originalCredit.debtorUserId,
+              debtorCustomerId:   originalCredit.debtorCustomerId,
+              authorizedBy:       userId!,
+              deviceId:           effectiveDevice,
+              notes:              input.notes ?? null,
             },
           })
 
@@ -630,7 +660,7 @@ export const creditsRouter = router({
             })
           }
 
-          // Verificar que no esté ya cancelado o completamente saldado
+          // Verificar que no esté ya cancelado
           const existing = await tx.creditTransaction.findFirst({
             where: {
               tenantId,
