@@ -78,8 +78,18 @@ export const auditRouter = router({
   // ──────────────────────────────────────────────────────────────────────────
   // startAudit — Abre una nueva auditoría física para una bodega
   //
-  // Guard crítico: solo puede haber UNA auditoría IN_PROGRESS por bodega.
-  // Dos arqueos simultáneos aplicarían ajustes duplicados en completeAudit.
+  // Guard de unicidad en dos capas (defensa en profundidad):
+  //
+  //   Capa 1 — aplicación: findFirst dentro de la transacción.
+  //     Detecta el conflicto en el caso normal y devuelve un mensaje con el
+  //     id de la auditoría activa para que el admin pueda cerrarla primero.
+  //
+  //   Capa 2 — base de datos: partial unique index
+  //     "InventoryAudit_warehouse_in_progress_key" sobre (tenantId, warehouseId)
+  //     WHERE status = 'IN_PROGRESS' (ver migration_audit_unique.sql).
+  //     Si dos requests concurrentes pasan la capa 1 simultáneamente,
+  //     la BD rechaza el segundo INSERT con P2002. El catch lo convierte
+  //     en TRPCError CONFLICT limpio — nunca llega un 500 al cliente.
   //
   // No pre-carga InventoryAuditItem — el operador registra solo los
   // productos que físicamente cuenta. Los no registrados se asumen sin
@@ -92,67 +102,90 @@ export const auditRouter = router({
       const { tenantId, userId, establishmentId, deviceId } = ctx.auth
       const { id: businessDayId } = ctx.businessDay
 
-      const result = await withTenantOptions(
-        tenantId,
-        async (tx) => {
-          // Validar que la bodega pertenece al establecimiento del admin
-          const warehouse = await tx.warehouse.findFirst({
-            where: {
-              id:             input.warehouseId,
-              tenantId,
-              establishmentId,
-              isActive:       true,
-              deletedAt:      null,
-            },
-            select: { id: true, name: true },
-          })
+      let result: Awaited<ReturnType<typeof withTenantOptions<{
+        audit: { id: string; status: AuditStatus; startedAt: Date; warehouseId: string; conductedBy: string }
+        warehouseName: string
+      }>>>
 
-          if (!warehouse) {
-            throw new TRPCError({
-              code:    'NOT_FOUND',
-              message: 'Bodega no encontrada o no pertenece a este establecimiento',
+      try {
+        result = await withTenantOptions(
+          tenantId,
+          async (tx) => {
+            // Validar que la bodega pertenece al establecimiento del admin
+            const warehouse = await tx.warehouse.findFirst({
+              where: {
+                id:             input.warehouseId,
+                tenantId,
+                establishmentId,
+                isActive:       true,
+                deletedAt:      null,
+              },
+              select: { id: true, name: true },
             })
-          }
 
-          // Guard: una sola auditoría activa por bodega
-          const existingAudit = await tx.inventoryAudit.findFirst({
-            where: {
-              tenantId,
-              warehouseId: input.warehouseId,
-              status:      AuditStatus.IN_PROGRESS,
-            },
-            select: { id: true },
-          })
+            if (!warehouse) {
+              throw new TRPCError({
+                code:    'NOT_FOUND',
+                message: 'Bodega no encontrada o no pertenece a este establecimiento',
+              })
+            }
 
-          if (existingAudit) {
-            throw new TRPCError({
-              code:    'CONFLICT',
-              message: `Ya existe una auditoría en progreso para esta bodega (id: ${existingAudit.id}). Ciérrala antes de iniciar una nueva.`,
+            // Capa 1 — guard de aplicación: detecta conflicto con mensaje útil
+            const existingAudit = await tx.inventoryAudit.findFirst({
+              where: {
+                tenantId,
+                warehouseId: input.warehouseId,
+                status:      AuditStatus.IN_PROGRESS,
+              },
+              select: { id: true },
             })
-          }
 
-          const audit = await tx.inventoryAudit.create({
-            data: {
-              tenantId,
-              establishmentId,
-              warehouseId:  input.warehouseId,
-              businessDayId,
-              status:       AuditStatus.IN_PROGRESS,
-              conductedBy:  userId!,
-            },
-            select: {
-              id:          true,
-              status:      true,
-              startedAt:   true,
-              warehouseId: true,
-              conductedBy: true,
-            },
+            if (existingAudit) {
+              throw new TRPCError({
+                code:    'CONFLICT',
+                message: `Ya existe una auditoría en progreso para esta bodega (id: ${existingAudit.id}). Ciérrala antes de iniciar una nueva.`,
+              })
+            }
+
+            const audit = await tx.inventoryAudit.create({
+              data: {
+                tenantId,
+                establishmentId,
+                warehouseId:  input.warehouseId,
+                businessDayId,
+                status:       AuditStatus.IN_PROGRESS,
+                conductedBy:  userId!,
+              },
+              select: {
+                id:          true,
+                status:      true,
+                startedAt:   true,
+                warehouseId: true,
+                conductedBy: true,
+              },
+            })
+
+            return { audit, warehouseName: warehouse.name }
+          },
+          { timeout: 10_000 },
+        )
+      } catch (err: unknown) {
+        // Capa 2 — guard de BD: el partial unique index rechaza el segundo
+        // INSERT concurrente con P2002 antes de que llegue a crear un duplicado.
+        // Convertimos el error crudo de Prisma en una respuesta CONFLICT limpia.
+        if (
+          err instanceof Error &&
+          'code' in err &&
+          (err as { code: string }).code === 'P2002'
+        ) {
+          throw new TRPCError({
+            code:    'CONFLICT',
+            message: 'Ya existe una auditoría en progreso para esta bodega. Ciérrala antes de iniciar una nueva.',
+            cause:   err,
           })
-
-          return { audit, warehouseName: warehouse.name }
-        },
-        { timeout: 10_000 },
-      )
+        }
+        throw err
+      }
 
       return {
         auditId:       result.audit.id,

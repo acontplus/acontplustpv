@@ -44,25 +44,29 @@ WHERE status = 'IN_PROGRESS';
 
 
 -- =============================================================================
--- ACCIÓN REQUERIDA: deprecar apply-manual-migrations.ts
+-- ESTADO DEL SCRIPT FAIL-OPEN: scripts/DEPRECATED_apply-manual-migrations.ts
 -- =============================================================================
 --
--- El archivo scripts/apply-manual-migrations.ts contiene políticas RLS con
--- la cláusula "OR current_tenant_id() IS NULL" (fail-OPEN).
+-- El archivo scripts/DEPRECATED_apply-manual-migrations.ts (nombre actual)
+-- contiene políticas RLS con "OR current_tenant_id() IS NULL" (fail-OPEN).
 -- Si se aplica ese script en producción en lugar de migration.sql (fail-CLOSED),
 -- el aislamiento multi-tenant queda silenciosamente roto.
 --
--- ACCIÓN: renombrar o eliminar ese archivo para que sea imposible confundirlo.
+-- Estado actual:
+--   ✓ Renombrado a DEPRECATED_apply-manual-migrations.ts
+--   ✓ Encabezado de advertencia añadido al inicio del archivo
+--   ✗ El contenido SQL peligroso sigue presente (riesgo operacional residual)
 --
--- Ejecutar desde la raíz del proyecto:
---   mv scripts/apply-manual-migrations.ts scripts/DEPRECATED_apply-manual-migrations.ts
---
--- Y añadir al inicio del archivo renombrado el siguiente comentario de advertencia:
+-- Para neutralizar completamente el riesgo, añadir al inicio de
+-- scripts/DEPRECATED_apply-manual-migrations.ts si no lo tiene ya:
 --
 --   // ⚠️ DEPRECADO — NO USAR EN PRODUCCIÓN
 --   // Este script contiene políticas RLS fail-OPEN (OR current_tenant_id() IS NULL).
 --   // El script correcto para producción es migration.sql en la raíz del proyecto,
 --   // que implementa políticas fail-CLOSED sin la cláusula OR NULL.
 --   // Ver MIGRATIONS_README.md para el proceso correcto de despliegue.
+--   throw new Error('DEPRECADO: ejecuta migration.sql, no este script.')
 --
+-- La línea throw garantiza que el script falle inmediatamente si alguien
+-- intenta ejecutarlo con tsx, sin posibilidad de error humano.
 -- =============================================================================
