@@ -1,0 +1,202 @@
+# =============================================================================
+# docker-compose.yml — acontplusTPV Stack Completo
+#
+# Servicios:
+#   postgres    → PostgreSQL 15 (base de datos principal)
+#   redis       → Redis 7 (colas BullMQ — resolución de conflictos offline)
+#   api         → Backend Fastify + tRPC (acontplusTPV-backend)
+#   powersync   → PowerSync Open Edition (sincronización Offline-First)
+#   nginx       → Reverse proxy + TLS termination (expuesto a internet)
+#
+# Seguridad de red:
+#   Red "internal": postgres y redis NUNCA expuestos a internet.
+#     Solo api y powersync pueden alcanzarlos.
+#   Red "proxy": nginx expuesto en puertos 80/443.
+#     Solo api y powersync son accesibles desde nginx.
+#   Sin puertos publicados en postgres/redis → aislamiento completo.
+#
+# Volúmenes persistentes:
+#   postgres_data  → datos de PostgreSQL sobreviven reinicios/deploys
+#   redis_data     → colas BullMQ persistidas en disco
+#   nginx_certs    → certificados TLS (Let's Encrypt / manual)
+#   powersync_data → estado interno de PowerSync
+# =============================================================================
+
+services:
+
+  # ── PostgreSQL 15 ──────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: acontplus_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB}
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Configuración de rendimiento para Hetzner CX32 (4 vCPU, 8GB RAM)
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=es_EC.UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Script de inicialización: crea usuarios adicionales y configura RLS
+      # Se ejecuta solo la primera vez (cuando el volumen está vacío)
+      - ./scripts/init-postgres.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    networks:
+      - internal
+    # Sin "ports" — postgres NO está expuesto fuera de la red interna
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+      start_period: 30s
+    # Configuración de performance para PostgreSQL
+    command: >
+      postgres
+        -c max_connections=100
+        -c shared_buffers=256MB
+        -c effective_cache_size=1GB
+        -c maintenance_work_mem=64MB
+        -c checkpoint_completion_target=0.9
+        -c wal_buffers=16MB
+        -c default_statistics_target=100
+        -c random_page_cost=1.1
+        -c effective_io_concurrency=200
+
+  # ── Redis 7 ────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: acontplus_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+        --appendonly yes
+        --appendfsync everysec
+        --requirepass ${REDIS_PASSWORD}
+        --maxmemory 256mb
+        --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - internal
+    # Sin "ports" — redis NO está expuesto fuera de la red interna
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+
+  # ── API Fastify ─────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: acontplus_api
+    restart: unless-stopped
+    environment:
+      NODE_ENV:    production
+      API_PORT:    3000
+      API_HOST:    0.0.0.0
+      # Base de datos — conexión interna via nombre de servicio Docker
+      DATABASE_URL:      postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DATABASE_URL_AUTH: postgresql://${POSTGRES_AUTH_USER}:${POSTGRES_AUTH_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      # JWT
+      JWT_SECRET:             ${JWT_SECRET}
+      JWT_REFRESH_SECRET:     ${JWT_REFRESH_SECRET}
+      POWERSYNC_JWT_SECRET:   ${POWERSYNC_JWT_SECRET}
+      # CORS — orígenes permitidos separados por coma
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      # Redis — para BullMQ (Fase futura)
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+    networks:
+      - internal
+      - proxy
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Sin "ports" — la API NO está expuesta directamente; pasa por nginx
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+      interval: 30s
+      timeout:  10s
+      retries:  3
+      start_period: 20s
+
+  # ── PowerSync Open Edition ──────────────────────────────────────────────────
+  powersync:
+    image: journeyapps/powersync-service:latest
+    container_name: acontplus_powersync
+    restart: unless-stopped
+    environment:
+      # PowerSync se conecta a PostgreSQL como replication slot
+      POSTGRES_URI:         postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      # Secret compartido con el backend para validar JWTs de PowerSync
+      POWERSYNC_JWT_SECRET: ${POWERSYNC_JWT_SECRET}
+      # URL pública de la API para que los clientes se autentiquen
+      API_URL:              ${API_PUBLIC_URL}
+    volumes:
+      # Archivo de sync rules — define qué datos bajan a cada dispositivo
+      - ./powersync/sync-rules.yaml:/home/node/packages/service/sync-rules.yaml:ro
+      - powersync_data:/home/node/packages/service/data
+    networks:
+      - internal
+      - proxy
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Sin "ports" — PowerSync NO está expuesto directamente; pasa por nginx
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/api/v1/status || exit 1"]
+      interval: 30s
+      timeout:  10s
+      retries:  3
+      start_period: 30s
+
+  # ── Nginx — Reverse Proxy ───────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: acontplus_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - nginx_certs:/etc/nginx/certs
+      # Para Let's Encrypt (certbot)
+      - nginx_acme:/var/www/acme-challenge:ro
+    networks:
+      - proxy
+    depends_on:
+      api:
+        condition: service_healthy
+      powersync:
+        condition: service_healthy
+
+# ── Volúmenes persistentes ────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  powersync_data:
+    driver: local
+  nginx_certs:
+    driver: local
+  nginx_acme:
+    driver: local
+
+# ── Redes ─────────────────────────────────────────────────────────────────────
+networks:
+  # Red interna: postgres, redis, api, powersync
+  # NUNCA expuesta a internet directamente
+  internal:
+    driver: bridge
+    internal: true   # Docker bloquea todo tráfico externo a esta red
+
+  # Red proxy: nginx, api, powersync
+  # nginx termina TLS y proxea hacia api y powersync
+  proxy:
+    driver: bridge

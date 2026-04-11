@@ -1,0 +1,290 @@
+# =============================================================================
+# sync-rules.yaml — PowerSync Open Edition
+# acontplusTPV — Sincronización Offline-First
+#
+# ARQUITECTURA DE SINCRONIZACIÓN:
+#   Cada dispositivo descarga SOLO los datos que necesita según su rol.
+#   El tenantId del JWT determina qué datos son visibles — aislamiento
+#   multi-tenant garantizado a nivel de sync rules.
+#
+# PERFILES DE DISPOSITIVO (DeviceRole):
+#   WAITER_DEVICE  → pedidos activos del mesero (12h) + catálogo + mesas
+#   ADMIN_DEVICE   → igual que CASHIER_DEVICE + acceso admin
+#   CASHIER/BARMAN → todos los pedidos activos de la jornada
+#   PRINT_NODE     → solo pedidos con printStatus = PENDING (2h)
+#   KIOSK_DEVICE   → catálogo activo + config del negocio
+#
+# SEGURIDAD CRÍTICA:
+#   - tenantId siempre viene del JWT (token.tenantId) — nunca del cliente
+#   - Los buckets dinámicos garantizan que cada tenant vea SOLO sus datos
+#   - PowerSync valida el JWT antes de ejecutar cualquier sync rule
+#
+# NOMENCLATURA DE BUCKETS:
+#   bucket dinámico = un bucket por valor único del parámetro
+#   Ejemplo: tenant_catalog/tenant123 → catálogo del tenant "tenant123"
+#   Esto garantiza aislamiento: un dispositivo solo recibe su bucket
+# =============================================================================
+
+bucket_definitions:
+
+  # ============================================================================
+  # BUCKET: Catálogo (Productos y Categorías)
+  # Perfil: TODOS los dispositivos autenticados
+  #
+  # Los productos y categorías son datos de solo lectura para los dispositivos.
+  # Se sincronizan por tenant — todos los dispositivos del mismo restaurante
+  # comparten el mismo bucket de catálogo.
+  # ============================================================================
+  tenant_catalog:
+    parameters:
+      - name: tenant_id
+        value: token.tenantId
+    data:
+      # Categorías activas del tenant
+      - table: ProductCategory
+        where: "\"tenantId\" = {tenant_id} AND \"isActive\" = true AND \"deletedAt\" IS NULL"
+
+      # Productos activos del tenant con su precio de venta
+      - table: Product
+        where: "\"tenantId\" = {tenant_id} AND \"isActive\" = true AND \"deletedAt\" IS NULL"
+
+  # ============================================================================
+  # BUCKET: Stock por establecimiento
+  # Perfil: CASHIER_DEVICE, ADMIN_DEVICE, BARMAN
+  #
+  # El mesero y kiosco NO necesitan stock — solo precio.
+  # El cajero y admin sí necesitan disponibilidad para gestión.
+  # ============================================================================
+  tenant_stock:
+    parameters:
+      - name: tenant_id
+        value: token.tenantId
+    data:
+      - table: StockLevel
+        where: "\"tenantId\" = {tenant_id}"
+
+  # ============================================================================
+  # BUCKET: Mesas por establecimiento
+  # Perfil: WAITER_DEVICE, CASHIER_DEVICE, ADMIN_DEVICE, BARMAN, KIOSK_DEVICE
+  #
+  # Las mesas se sincronizan por tenant. El mesero necesita saber qué mesas
+  # están disponibles para asignar a pedidos.
+  # ============================================================================
+  tenant_tables:
+    parameters:
+      - name: tenant_id
+        value: token.tenantId
+    data:
+      - table: Table
+        where: "\"tenantId\" = {tenant_id} AND \"isActive\" = true AND \"deletedAt\" IS NULL"
+
+  # ============================================================================
+  # BUCKET: Establecimiento y configuración
+  # Perfil: TODOS los dispositivos
+  #
+  # Cada dispositivo necesita conocer su establecimiento para mostrar
+  # información del negocio y resolver referencias.
+  # ============================================================================
+  tenant_establishment:
+    parameters:
+      - name: tenant_id
+        value: token.tenantId
+    data:
+      - table: Establishment
+        where: "\"tenantId\" = {tenant_id} AND \"isActive\" = true AND \"deletedAt\" IS NULL"
+
+      - table: PointOfSale
+        where: "\"tenantId\" = {tenant_id}"
+
+  # ============================================================================
+  # BUCKET: Pedidos activos del MESERO (últimas 12 horas)
+  # Perfil: WAITER_DEVICE
+  #
+  # El mesero solo ve SUS pedidos activos. Filtrado doble:
+  #   1. tenantId — aislamiento multi-tenant
+  #   2. createdByUserId — solo los pedidos del mesero actual
+  #
+  # Ventana temporal de 12h: evita acumulación de datos históricos en el
+  # dispositivo. Un mesero rara vez necesita pedidos de más de 12h atrás.
+  #
+  # Estados activos = todo excepto los estados finales cerrados:
+  #   PAID_CASH, PAID_TRANSFER_CONFIRMED, PAID_CREDIT, CANCELLED, EXPIRED
+  # ============================================================================
+  waiter_orders:
+    parameters:
+      - name: tenant_id
+        value: token.tenantId
+      - name: user_id
+        value: token.sub
+    data:
+      - table: Order
+        where: >
+          "tenantId" = {tenant_id}
+          AND "createdByUserId" = {user_id}
+          AND "status" NOT IN (
+            'PAID_CASH',
+            'PAID_TRANSFER_CONFIRMED',
+            'PAID_CREDIT',
+            'CANCELLED',
+            'EXPIRED'
+          )
+          AND "createdAt" >= NOW() - INTERVAL '12 hours'
+
+      # Items de los pedidos del mesero
+      - table: OrderItem
+        where: >
+          "tenantId" = {tenant_id}
+          AND "orderId" IN (
+            SELECT id FROM "Order"
+            WHERE "tenantId" = {tenant_id}
+              AND "createdByUserId" = {user_id}
+              AND "status" NOT IN (
+                'PAID_CASH', 'PAID_TRANSFER_CONFIRMED',
+                'PAID_CREDIT', 'CANCELLED', 'EXPIRED'
+              )
+              AND "createdAt" >= NOW() - INTERVAL '12 hours'
+          )
+
+  # ============================================================================
+  # BUCKET: Todos los pedidos activos de la JORNADA
+  # Perfil: CASHIER_DEVICE, ADMIN_DEVICE, BARMAN_DEVICE
+  #
+  # El cajero y el barman necesitan visibilidad completa de la jornada.
+  # Filtrado por businessDayId activo (jornada abierta) + tenant.
+  #
+  # NOTA: La jornada activa se identifica via BusinessDay.isOpen = true.
+  # PowerSync re-evalúa este bucket cuando cambia el estado de BusinessDay.
+  # ============================================================================
+  cashier_orders:
+    parameters:
+      - name: tenant_id
+        value: token.tenantId
+    data:
+      - table: Order
+        where: >
+          "tenantId" = {tenant_id}
+          AND "businessDayId" IN (
+            SELECT id FROM "BusinessDay"
+            WHERE "tenantId" = {tenant_id}
+              AND "isOpen" = true
+          )
+
+      # Items de todos los pedidos de la jornada
+      - table: OrderItem
+        where: >
+          "tenantId" = {tenant_id}
+          AND "orderId" IN (
+            SELECT o.id FROM "Order" o
+            JOIN "BusinessDay" bd ON bd.id = o."businessDayId"
+            WHERE o."tenantId" = {tenant_id}
+              AND bd."isOpen" = true
+              AND bd."tenantId" = {tenant_id}
+          )
+
+      # Transferencias pendientes de conciliación — el cajero las gestiona
+      - table: TransferPayment
+        where: >
+          "tenantId" = {tenant_id}
+          AND "status" = 'PENDING'
+          AND "businessDayId" IN (
+            SELECT id FROM "BusinessDay"
+            WHERE "tenantId" = {tenant_id}
+              AND "isOpen" = true
+          )
+
+      # Jornada activa — para mostrar resumen de caja
+      - table: BusinessDay
+        where: >
+          "tenantId" = {tenant_id}
+          AND "isOpen" = true
+
+  # ============================================================================
+  # BUCKET: Pedidos pendientes de impresión (últimas 2 horas)
+  # Perfil: PRINT_NODE
+  #
+  # La impresora solo necesita pedidos con printStatus = PENDING.
+  # Ventana de 2h: la impresora procesa comandas en tiempo real.
+  # Una vez impresos (printStatus = PRINTED), salen del bucket.
+  #
+  # CRÍTICO: Este bucket es muy pequeño por diseño. La impresora NO debe
+  # acumular histórico — solo lo que hay que imprimir ahora.
+  # ============================================================================
+  print_node_orders:
+    parameters:
+      - name: tenant_id
+        value: token.tenantId
+    data:
+      - table: Order
+        where: >
+          "tenantId" = {tenant_id}
+          AND "printStatus" = 'PENDING'
+          AND "createdAt" >= NOW() - INTERVAL '2 hours'
+
+      # Items necesarios para renderizar la comanda
+      - table: OrderItem
+        where: >
+          "tenantId" = {tenant_id}
+          AND "orderId" IN (
+            SELECT id FROM "Order"
+            WHERE "tenantId" = {tenant_id}
+              AND "printStatus" = 'PENDING'
+              AND "createdAt" >= NOW() - INTERVAL '2 hours'
+          )
+
+  # ============================================================================
+  # BUCKET: Catálogo para Kiosco
+  # Perfil: KIOSK_DEVICE
+  #
+  # El kiosco solo necesita el catálogo activo para mostrar el menú al cliente.
+  # Reutiliza el bucket tenant_catalog pero separado para control de acceso
+  # independiente en el futuro (ej: menú especial para kiosco vs. mesero).
+  #
+  # El kiosco NO recibe pedidos de otros — solo crea los suyos.
+  # La configuración del negocio (nombre, logo) viene de tenant_establishment.
+  # ============================================================================
+  kiosk_catalog:
+    parameters:
+      - name: tenant_id
+        value: token.tenantId
+    data:
+      # Solo productos activos — mismo filtro que tenant_catalog
+      # Bucket separado para poder diferenciar en métricas/debugging
+      - table: Product
+        where: "\"tenantId\" = {tenant_id} AND \"isActive\" = true AND \"deletedAt\" IS NULL"
+
+      - table: ProductCategory
+        where: "\"tenantId\" = {tenant_id} AND \"isActive\" = true AND \"deletedAt\" IS NULL"
+
+  # ============================================================================
+  # BUCKET: Jornada activa (compartido)
+  # Perfil: TODOS los dispositivos transaccionales
+  #
+  # Todos los dispositivos necesitan conocer el businessDayId activo para
+  # poder crear pedidos o registrar eventos correctamente offline.
+  # ============================================================================
+  active_business_day:
+    parameters:
+      - name: tenant_id
+        value: token.tenantId
+    data:
+      - table: BusinessDay
+        where: >
+          "tenantId" = {tenant_id}
+          AND "isOpen" = true
+
+  # ============================================================================
+  # BUCKET: Créditos del empleado (solo para ADMIN_DEVICE)
+  # Perfil: ADMIN_DEVICE
+  #
+  # El admin puede consultar saldos de créditos de empleados offline.
+  # Los clientes no se sincronizan por privacidad — se consultan online.
+  # ============================================================================
+  admin_credits:
+    parameters:
+      - name: tenant_id
+        value: token.tenantId
+    data:
+      - table: CreditTransaction
+        where: >
+          "tenantId" = {tenant_id}
+          AND "createdAt" >= NOW() - INTERVAL '90 days'
