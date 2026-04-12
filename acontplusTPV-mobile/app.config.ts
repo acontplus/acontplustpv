@@ -81,9 +81,6 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     // expo-splash-screen: control programático del splash screen
     'expo-splash-screen',
 
-    // @powersync/react-native: configura op-sqlite y el módulo nativo de PowerSync
-    '@powersync/react-native',
-
     // react-native-quick-crypto: crypto nativo requerido por PowerSync para TLS
     [
       'react-native-quick-crypto',
