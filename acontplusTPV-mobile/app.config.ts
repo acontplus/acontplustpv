@@ -16,7 +16,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   slug:        'acontplustpv',
   version:     '1.0.0',
   orientation: 'portrait',
-  icon:        './assets/icon.png',
+  //icon:        './assets/icon.png',
   userInterfaceStyle: 'light',
 
   // ── Splash screen ──────────────────────────────────────────────────────────
@@ -42,10 +42,11 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
 
   // ── Android ────────────────────────────────────────────────────────────────
   android: {
+	  /*
     adaptiveIcon: {
       foregroundImage: './assets/adaptive-icon.png',
       backgroundColor: '#1e293b',
-    },
+    },*/
     package:     'com.acontplus.tpv',
     permissions: [
       // Necesario para que la app detecte reconexión y sincronice
