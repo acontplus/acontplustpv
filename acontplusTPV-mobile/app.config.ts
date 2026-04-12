@@ -81,14 +81,6 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     // expo-splash-screen: control programático del splash screen
     'expo-splash-screen',
 
-    // react-native-quick-crypto: crypto nativo requerido por PowerSync para TLS
-    [
-      'react-native-quick-crypto',
-      {
-        // Reemplaza el módulo crypto de Node.js con la implementación nativa
-        enableAutoReplace: true,
-      },
-    ],
   ],
 
   // ── Scheme para deep linking ────────────────────────────────────────────────
