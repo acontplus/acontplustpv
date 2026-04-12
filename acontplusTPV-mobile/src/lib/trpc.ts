@@ -72,10 +72,18 @@ function createTrpcLink() {
       // Evitar múltiples refreshes concurrentes (race condition)
       if (!isRefreshing) {
         isRefreshing = true
-        refreshPromise = useAuthStore.getState().refreshAccessToken().finally(() => {
-          isRefreshing    = false
-          refreshPromise  = null
-        })
+        refreshPromise = useAuthStore
+          .getState()
+          .refreshAccessToken()
+          .catch(() => null)   // CRÍTICO: si refreshAccessToken lanza (sin red, backend
+                               // caído, etc.), la promesa resuelve a null en lugar de
+                               // rechazar. Sin esto, todos los requests en vuelo que
+                               // comparten esta promesa fallarían con una excepción no
+                               // controlada en lugar de recibir el flujo de null → 401.
+          .finally(() => {
+            isRefreshing   = false
+            refreshPromise = null
+          })
       }
 
       // Esperar a que el refresh termine (todos los requests en vuelo comparten)

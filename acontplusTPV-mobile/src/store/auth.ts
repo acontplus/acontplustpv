@@ -212,23 +212,37 @@ export const useAuthStore = create<AuthState & AuthActions>()(
         return result.accessToken
 
       } catch (err: unknown) {
-        const error = err as Error & { status?: number; code?: string }
+        const error = err as Error & { status?: number; code?: string; message: string }
 
-        // KILL SWITCH: 401 con código UNAUTHORIZED = usuario desactivado
+        // KILL SWITCH: activar disconnectAndClear() ÚNICAMENTE cuando el backend
+        // confirma explícitamente que el usuario fue desactivado (isActive = false).
+        //
+        // El endpoint auth.refresh devuelve code: 'UNAUTHORIZED' en 4 escenarios:
+        //   1. refreshToken con firma inválida o expirado  → NO borrar datos
+        //   2. hash del refreshToken no coincide           → NO borrar datos
+        //   3. usuario no encontrado en BD                 → NO borrar datos
+        //   4. user.isActive === false                     → SÍ borrar datos ✓
+        //
+        // El único discriminador fiable entre estos casos es el message exacto
+        // que devuelve el backend (src/routers/auth.ts, caso isActive = false).
         // Instrucciones §2: "la app SOLO ejecuta disconnectAndClear() cuando
-        // recibe 401 por isActive = false"
-        if (error.status === 401 || error.code === 'UNAUTHORIZED') {
+        // recibe 401 por isActive = false, NO por expiración natural del token."
+        const isKillSwitch =
+          (error.status === 401 || error.code === 'UNAUTHORIZED') &&
+          error.message === 'Usuario desactivado'
+
+        if (isKillSwitch) {
           // Limpiar estado local
           await SecureStore.deleteItemAsync(KEYS.ACCESS_TOKEN)
           await SecureStore.deleteItemAsync(KEYS.REFRESH_TOKEN)
           await SecureStore.deleteItemAsync(KEYS.USER)
 
           set(state => {
-            state.accessToken  = null
-            state.refreshToken = null
-            state.user         = null
+            state.accessToken   = null
+            state.refreshToken  = null
+            state.user          = null
             state.businessDayId = null
-            state.error        = 'Tu sesión ha sido desactivada. Contacta al administrador.'
+            state.error         = 'Tu sesión ha sido desactivada. Contacta al administrador.'
           })
 
           // Borrar todos los datos locales de PowerSync
