@@ -1,0 +1,70 @@
+# =============================================================================
+# docker-compose.certbot.yml
+# Servicio Certbot para certificados TLS Let's Encrypt
+#
+# USO:
+#   Obtener certificados por primera vez:
+#     docker compose -f docker-compose.yml -f docker-compose.certbot.yml \
+#       run --rm certbot certonly --webroot \
+#       -w /var/www/acme-challenge \
+#       -d api.tudominio.com \
+#       -d powersync.tudominio.com \
+#       -d admin.tudominio.com \
+#       --email admin@tudominio.com \
+#       --agree-tos --no-eff-email
+#
+#   Renovación automática (cron del host o timer de systemd):
+#     docker compose -f docker-compose.yml -f docker-compose.certbot.yml \
+#       run --rm certbot renew --quiet
+#     docker compose exec nginx nginx -s reload
+#
+#   Ver certificados actuales:
+#     docker compose -f docker-compose.yml -f docker-compose.certbot.yml \
+#       run --rm certbot certificates
+#
+# POR QUÉ UN CONTENEDOR SEPARADO (no integrado en Nginx):
+#   Certbot necesita acceso al filesystem del host para escribir certificados.
+#   Si lo metemos dentro de Nginx, complica la imagen y el reload del proceso.
+#   El patrón correcto es: Certbot escribe → volumen compartido → Nginx lee.
+#   Nginx solo se recarga cuando los certificados cambian (via cron + nginx -s reload).
+#
+# RENOVACIÓN AUTOMÁTICA:
+#   Let's Encrypt renueva certificados 30 días antes de expirar.
+#   Configurar este cron en el HOST (no dentro de Docker):
+#
+#   Agregar a crontab del root en el VPS:
+#     crontab -e
+#     # Renovar certificados todos los días a las 3:00 AM
+#     0 3 * * * cd /opt/acontplus && \
+#       docker compose -f docker-compose.yml -f docker-compose.certbot.yml \
+#       run --rm certbot renew --quiet && \
+#       docker compose exec nginx nginx -s reload >> /var/log/certbot-renew.log 2>&1
+# =============================================================================
+
+services:
+  certbot:
+    image: certbot/certbot:latest
+    container_name: acontplus_certbot
+    # Solo se ejecuta cuando se invoca explícitamente (no tiene restart)
+    volumes:
+      # Certificados: compartido con Nginx (nginx_certs definido en docker-compose.yml)
+      - nginx_certs:/etc/letsencrypt
+      # Desafíos ACME: compartido con Nginx para validación webroot
+      - nginx_acme:/var/www/acme-challenge
+    # El contenedor termina inmediatamente al iniciarse sin comando
+    # Se usa con "docker compose run --rm certbot <comando>"
+    entrypoint: /bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done'
+    networks:
+      - proxy  # Necesita acceso a la red para validación ACME (opcional con webroot)
+
+# Referenciar los volúmenes del docker-compose.yml principal
+# (no se crean aquí — ya existen en docker-compose.yml)
+volumes:
+  nginx_certs:
+    external: true
+  nginx_acme:
+    external: true
+
+networks:
+  proxy:
+    external: true
