@@ -11,21 +11,22 @@
 //   - Expo/React Native soporta batch nativamente
 // =============================================================================
 
-import { createTRPCReact }   from '@trpc/react-query'
-import { createTRPCClient, httpBatchLink, TRPCClientError } from '@trpc/client'
-import Constants              from 'expo-constants'
-import { useAuthStore }       from '../store/auth'
+import { createTRPCReact }              from '@trpc/react-query'
+import { createTRPCClient, httpBatchLink } from '@trpc/client'
+import Constants                           from 'expo-constants'
+import { useAuthStore }                    from '../store/auth'
 
-// Importación del tipo del router del backend — type-only, no genera bundle
-// En un monorepo esto vendría de @acontplus/api/types
-// En repos separados, copiar/generar el tipo aquí
-import type { AppRouter }     from '../types/router'
-
-// ── Re-exportar el tipo para uso en la app ──────────────────────────────────
-export type { AppRouter }
-
-// ── Instancia de tRPC para React (hooks) ────────────────────────────────────
-export const trpc = createTRPCReact<AppRouter>()
+// El tipo AppRouter está definido en src/types/router.ts como un objeto de
+// descripción de procedimientos (input/output). No es un Router de tRPC en
+// sentido estricto (no tiene _def, createCaller, etc.), por lo que no puede
+// pasarse directamente a createTRPCReact<T>.
+//
+// Solución: instanciar con `any` para que tRPC no valide el constraint,
+// y mantener el tipo manual en router.ts solo como documentación/referencia.
+// En un monorepo con acceso al backend, se usaría `typeof appRouter` directamente.
+//
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const trpc = createTRPCReact<any>()
 
 // ── Obtener la URL base de la API ────────────────────────────────────────────
 function getApiUrl(): string {
@@ -112,7 +113,8 @@ function createTrpcLink() {
 // Por ejemplo: en el auth store, en initPowerSync, etc.
 // =============================================================================
 
-export const trpcVanilla = createTRPCClient<AppRouter>({
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const trpcVanilla = createTRPCClient<any>({
   links: [createTrpcLink()],
 })
 

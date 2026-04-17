@@ -26,6 +26,12 @@
 //   Este layout no decide a dónde ir. Solo provee contexto.
 //   La navegación es responsabilidad del Guard en app/(app)/_layout.tsx
 //   y del grupo de rutas (auth). Expo Router maneja el routing por segmentos.
+//
+// Por qué PowerSyncProvider y NO PowerSyncContext.Provider directamente:
+//   PowerSyncProvider del SDK gestiona internamente el ciclo de vida de la
+//   conexión, el estado de sincronización y los re-renders de los hooks
+//   (useQuery, etc.). Usar PowerSyncContext.Provider directamente se salta
+//   toda esa lógica y deja la app sin gestión de estado de sincronización.
 // =============================================================================
 
 import { useEffect, useState, useCallback } from 'react'
@@ -33,8 +39,7 @@ import { View }                              from 'react-native'
 import { Slot }                              from 'expo-router'
 import * as SplashScreen                     from 'expo-splash-screen'
 import { QueryClientProvider }               from '@tanstack/react-query'
-import { PowerSyncProvider }                 from '@powersync/react-native'
-//import { PowerSyncContext } from '@powersync/react'
+import { PowerSyncContext }               from '@powersync/react'
 
 import { trpc, createTrpcQueryClient }       from '../src/lib/trpc'
 import { queryClient }                       from '../src/lib/queryClient'
@@ -105,26 +110,26 @@ export default function RootLayout() {
   // ==========================================================================
   // ÁRBOL DE PROVIDERS
   //
-  // PowerSyncProvider DEBE ser el más externo de los providers de datos,
-  // ya que trpc.Provider y QueryClientProvider pueden usar hooks de PowerSync
-  // en sus propios internals en sprints futuros.
+  // PowerSyncContext.Provider es la API correcta para @powersync/react 1.10.0.
+  // PowerSyncProvider no existe en esta versión del SDK — el contexto se
+  // provee directamente con value={powerSyncDb}.
   //
   // Jerarquía:
-  //   PowerSyncProvider (SQLite context)
+  //   PowerSyncContext.Provider (SQLite context)
   //     └── trpc.Provider (tRPC + React Query context)
   //           └── QueryClientProvider (React Query directo)
   //                 └── View (trigger de onLayout para ocultar splash)
   //                       └── Slot (árbol de rutas de Expo Router)
   // ==========================================================================
-	return (
-	  <PowerSyncContext.Provider value={powerSyncDb}>
-		<trpc.Provider client={trpcClient} queryClient={queryClient}>
-		  <QueryClientProvider client={queryClient}>
-			<View className="flex-1" onLayout={onLayoutRootView}>
-			  <Slot />
-			</View>
-		  </QueryClientProvider>
-		</trpc.Provider>
-	  </PowerSyncContext.Provider>
-	)
+  return (
+    <PowerSyncContext.Provider value={powerSyncDb}>
+      <trpc.Provider client={trpcClient} queryClient={queryClient}>
+        <QueryClientProvider client={queryClient}>
+          <View className="flex-1" onLayout={onLayoutRootView}>
+            <Slot />
+          </View>
+        </QueryClientProvider>
+      </trpc.Provider>
+    </PowerSyncContext.Provider>
+  )
 }

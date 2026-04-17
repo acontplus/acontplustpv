@@ -7,7 +7,7 @@
 import { useCallback }          from 'react'
 import { View, Text, TouchableOpacity, Alert } from 'react-native'
 import { StatusBar }            from 'expo-status-bar'
-import { useAuthStore, selectUser, selectRoles } from '../src/store/auth'
+import { useAuthStore, selectUser, selectRoles } from '../../src/store/auth'
 
 export default function ProfileScreen() {
   const user   = useAuthStore(selectUser)

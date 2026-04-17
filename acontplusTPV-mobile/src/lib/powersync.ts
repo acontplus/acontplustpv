@@ -19,6 +19,7 @@
 
 import {
   PowerSyncDatabase,
+  AbstractPowerSyncDatabase,
   column,
   Schema,
   Table,
@@ -247,7 +248,7 @@ class AcontPlusConnector {
    * Si en el futuro se implementa el patrón de upload via PowerSync,
    * este método procesaría los cambios de la cola.
    */
-  async uploadData(_database: PowerSyncDatabase): Promise<void> {
+  async uploadData(_database: AbstractPowerSyncDatabase): Promise<void> {
     // Las escrituras van por tRPC, no por PowerSync upload
     // PowerSync actúa como read-only sync en este diseño
     return
