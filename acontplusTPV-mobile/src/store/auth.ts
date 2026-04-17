@@ -322,11 +322,24 @@ export const useAuthStore = create<AuthState & AuthActions>()(
 )
 
 // ── Selector helpers ─────────────────────────────────────────────────────────
-// Evitan re-renders innecesarios al suscribirse solo a lo que se necesita
+// Evitan re-renders innecesarios al suscribirse solo a lo que se necesita.
+//
+// REGLA CRÍTICA — Zustand v5 + React 18 (useSyncExternalStore):
+//   React llama a getSnapshot() dos veces para verificar consistencia.
+//   Si el selector devuelve un objeto/array NUEVO en cada llamada
+//   (aunque con el mismo contenido), React lanza:
+//   "Warning: The result of getSnapshot should be cached to avoid an infinite loop"
+//
+//   Solución: nunca devolver literales inline como fallback.
+//   Usar una constante estable de módulo en su lugar.
+//   EMPTY_ROLES es creado UNA sola vez al cargar el módulo — siempre
+//   es el mismo objeto en memoria → React.is() devuelve true → sin warning.
+
+const EMPTY_ROLES: UserRole[] = []
 
 export const selectIsAuthenticated = (s: AuthState) => !!s.accessToken && !!s.user
 export const selectUser            = (s: AuthState) => s.user
-export const selectRoles           = (s: AuthState) => s.user?.roles ?? []
+export const selectRoles           = (s: AuthState) => s.user?.roles ?? EMPTY_ROLES
 export const selectBusinessDayId   = (s: AuthState) => s.businessDayId
 export const selectIsAdmin         = (s: AuthState) => s.user?.roles.includes('ADMIN') ?? false
 export const selectIsCashier       = (s: AuthState) =>

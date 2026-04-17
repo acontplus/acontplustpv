@@ -3,12 +3,23 @@
 // Pantalla de Login — acontplusTPV
 //
 // Flujo de pantalla:
-//   Paso 1 (SLUG):         Ingreso del slug del tenant (ej: "mi-restaurante")
+//   Paso 1 (SLUG):          Ingreso del slug del tenant (ej: "mi-restaurante")
 //   Paso 2 (ESTABLISHMENT): Selección del establecimiento del tenant
-//   Paso 3 (PIN):          Teclado numérico de 4 dígitos
+//   Paso 3 (PIN):           Teclado numérico de 4 dígitos
 //
-// El slug se guarda en SecureStore para auto-completar en el próximo login.
+// El slug se guarda en AsyncStorage (no SecureStore — es dato público)
+// para auto-completar en el próximo login.
 // El PIN nunca se almacena — solo viaja una vez por HTTPS al servidor.
+//
+// Correcciones Sprint 1 aplicadas en este archivo:
+//   M-02: Stale closure en handlePinKey — usar setPin(prev => ...) funcional
+//   M-03: setTimeout sin cleanup en useEffect del shake — limpiado en return
+//   Selectores: useAuthStore con selector granular para evitar re-renders masivos
+//
+// Sobre la navegación post-login:
+//   Este componente NO navega. Solo llama a login() del store.
+//   El Guard en app/(app)/_layout.tsx detecta isAuthenticated → true
+//   y hace el redirect. Ver comentario en app/(auth)/login.tsx.
 // =============================================================================
 
 import React, {
@@ -26,11 +37,11 @@ import {
   KeyboardAvoidingView,
   Platform,
   ScrollView,
-  Alert,
   Vibration,
   Animated,
 }                              from 'react-native'
 import { StatusBar }           from 'expo-status-bar'
+import AsyncStorage            from '@react-native-async-storage/async-storage'
 import * as SecureStore        from 'expo-secure-store'
 import Constants               from 'expo-constants'
 import { useAuthStore }        from '../store/auth'
@@ -58,17 +69,16 @@ interface PinKeyProps {
   variant?: 'default' | 'delete' | 'empty'
 }
 
-function PinKey({ label, onPress, variant = 'default' }: PinKeyProps) {
+const PinKey = React.memo(function PinKey({ label, onPress, variant = 'default' }: PinKeyProps) {
   const scaleAnim = useRef(new Animated.Value(1)).current
 
-  const handlePress = () => {
-    // Animación de tap
+  const handlePress = useCallback(() => {
     Animated.sequence([
       Animated.timing(scaleAnim, { toValue: 0.9, duration: 80, useNativeDriver: true }),
       Animated.timing(scaleAnim, { toValue: 1,   duration: 80, useNativeDriver: true }),
     ]).start()
     onPress()
-  }
+  }, [onPress, scaleAnim])
 
   if (variant === 'empty') {
     return <View className="flex-1 m-1.5 h-16" />
@@ -99,7 +109,7 @@ function PinKey({ label, onPress, variant = 'default' }: PinKeyProps) {
       </TouchableOpacity>
     </Animated.View>
   )
-}
+})
 
 // ── Indicador de dígitos del PIN ──────────────────────────────────────────────
 interface PinDotsProps {
@@ -108,7 +118,7 @@ interface PinDotsProps {
   shake:   boolean
 }
 
-function PinDots({ length, filled, shake }: PinDotsProps) {
+const PinDots = React.memo(function PinDots({ length, filled, shake }: PinDotsProps) {
   const shakeAnim = useRef(new Animated.Value(0)).current
 
   useEffect(() => {
@@ -121,7 +131,7 @@ function PinDots({ length, filled, shake }: PinDotsProps) {
         Animated.timing(shakeAnim, { toValue: 0,   duration: 60, useNativeDriver: true }),
       ]).start()
     }
-  }, [shake])
+  }, [shake, shakeAnim])
 
   return (
     <Animated.View
@@ -139,25 +149,25 @@ function PinDots({ length, filled, shake }: PinDotsProps) {
       ))}
     </Animated.View>
   )
-}
+})
 
 // =============================================================================
-// PANTALLA PRINCIPAL
+// CONSTANTES
 // =============================================================================
 
+// B-02 CORREGIDO: el slug es dato público (lo comparten todos los empleados),
+// no merece el Keychain/Keystore de SecureStore. AsyncStorage es suficiente.
 const SLUG_STORAGE_KEY = 'acontplus_last_slug'
-const PIN_LENGTH = 4
+const PIN_LENGTH       = 4
 
-// Fetch de establecimientos sin tRPC (se llama antes del login)
+// Fetch de establecimientos sin tRPC (se llama antes del login, no hay token)
 async function fetchEstablishments(tenantSlug: string): Promise<Establishment[]> {
   const apiUrl = Constants.expoConfig?.extra?.apiUrl ?? ''
 
-  // Llamada al endpoint público de establecimientos del tenant
-  // El tenant resuelve el slug en el servidor
   const res = await fetch(`${apiUrl}/trpc/auth.listEstablishments`, {
-    method: 'POST',
+    method:  'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ json: { tenantSlug } }),
+    body:    JSON.stringify({ json: { tenantSlug } }),
   })
 
   if (!res.ok) {
@@ -166,7 +176,7 @@ async function fetchEstablishments(tenantSlug: string): Promise<Establishment[]>
 
   const data = await res.json() as {
     result?: { data?: { json: Establishment[] } }
-    error?: { message: string }
+    error?:  { message: string }
   }
 
   if (data.error) {
@@ -177,46 +187,101 @@ async function fetchEstablishments(tenantSlug: string): Promise<Establishment[]>
 }
 
 // =============================================================================
-// COMPONENTE
+// COMPONENTE PRINCIPAL
 // =============================================================================
 
 export default function LoginScreen() {
-  const { login, isLoading, error, clearError } = useAuthStore()
+  // ── Selectores granulares de Zustand (M-02 CORREGIDO) ────────────────────
+  // Suscribirse con selector individual en lugar de desestructurar el store
+  // completo. Así el componente solo re-renderiza cuando cambia el campo
+  // específico que le importa, no ante cualquier cambio del store.
+  const login      = useAuthStore(s => s.login)
+  const isLoading  = useAuthStore(s => s.isLoading)
+  const error      = useAuthStore(s => s.error)
+  const clearError = useAuthStore(s => s.clearError)
 
-  // ── Estado de la pantalla ──────────────────────────────────────────────────
-  const [step,               setStep]              = useState<LoginStep>('SLUG')
-  const [tenantSlug,         setTenantSlug]         = useState('')
-  const [establishments,     setEstablishments]     = useState<Establishment[]>([])
-  const [selectedEstId,      setSelectedEstId]      = useState<string | null>(null)
-  const [pin,                setPin]                = useState('')
-  const [slugLoading,        setSlugLoading]        = useState(false)
-  const [slugError,          setSlugError]          = useState<string | null>(null)
-  const [pinShake,           setPinShake]           = useState(false)
+  // ── Estado local de la pantalla ───────────────────────────────────────────
+  const [step,           setStep]          = useState<LoginStep>('SLUG')
+  const [tenantSlug,     setTenantSlug]    = useState('')
+  const [establishments, setEstablishments] = useState<Establishment[]>([])
+  const [selectedEstId,  setSelectedEstId] = useState<string | null>(null)
+  const [pin,            setPin]           = useState('')
+  const [slugLoading,    setSlugLoading]   = useState(false)
+  const [slugError,      setSlugError]     = useState<string | null>(null)
+  const [pinShake,       setPinShake]      = useState(false)
 
   const slugInputRef = useRef<TextInput>(null)
 
-  // ── Cargar el slug guardado ────────────────────────────────────────────────
+  // ── Cargar el slug guardado al montar ────────────────────────────────────
   useEffect(() => {
-    SecureStore.getItemAsync(SLUG_STORAGE_KEY).then(saved => {
+    AsyncStorage.getItem(SLUG_STORAGE_KEY).then(saved => {
       if (saved) setTenantSlug(saved)
-    })
+    }).catch(() => { /* AsyncStorage vacío — arrancar sin slug */ })
   }, [])
 
-  // ── Limpiar error del store al desmontar ───────────────────────────────────
+  // ── Limpiar error del store al desmontar ─────────────────────────────────
   useEffect(() => {
-    return () => clearError()
-  }, [])
+    return () => { clearError() }
+  }, [clearError])
 
-  // ── Shake cuando hay error de PIN ─────────────────────────────────────────
+  // ── Animación de shake cuando hay error de PIN (M-03 CORREGIDO) ──────────
+  // El setTimeout tiene su cleanup en el return del useEffect para evitar
+  // llamar a setPinShake en un componente ya desmontado.
   useEffect(() => {
+    let timeoutId: ReturnType<typeof setTimeout>
+
     if (error && step === 'PIN') {
       setPinShake(true)
       setPin('')
-      setTimeout(() => setPinShake(false), 400)
+      timeoutId = setTimeout(() => setPinShake(false), 400)
     }
-  }, [error])
 
-  // ── PASO 1: validar slug y cargar establecimientos ─────────────────────────
+    // Cleanup: cancela el timeout si el componente se desmonta o si
+    // error/step cambian antes de que los 400ms expiren.
+    return () => { clearTimeout(timeoutId) }
+  }, [error, step])
+
+  // ── PASO 3: submit del PIN ─────────────────────────────────────────────────
+  // Definido antes de handlePinKey para poder ser referenciado en él.
+  const handlePinSubmit = useCallback(async (submittedPin: string) => {
+    if (!selectedEstId) return
+
+    try {
+      await login(tenantSlug.trim().toLowerCase(), submittedPin, selectedEstId)
+      // Login exitoso → NO navegamos aquí.
+      // El Guard en app/(app)/_layout.tsx detecta isAuthenticated → true
+      // y hace el redirect a /(app) automáticamente.
+    } catch {
+      // El error ya está en el store → el useEffect del shake lo detecta
+    }
+  }, [tenantSlug, selectedEstId, login])
+
+  // ── PASO 3: ingreso de dígitos (M-02 CORREGIDO) ──────────────────────────
+  // Usar setPin con updater funcional (prev => ...) elimina la dependencia
+  // en `pin` del closure y evita el stale closure en taps rápidos.
+  // handlePinSubmit se incluye en las dependencias correctamente.
+  const handlePinKey = useCallback((digit: string) => {
+    setPin(prev => {
+      if (prev.length >= PIN_LENGTH) return prev
+      const next = prev + digit
+
+      if (next.length === PIN_LENGTH) {
+        // Ejecutar en microtask: permite que React pinte el 4to punto
+        // antes de que el submit bloquee el JS thread con el fetch.
+        setTimeout(() => handlePinSubmit(next), 0)
+      }
+
+      return next
+    })
+  }, [handlePinSubmit])
+
+  // ── PASO 3: borrar último dígito ─────────────────────────────────────────
+  const handlePinDelete = useCallback(() => {
+    setPin(prev => prev.slice(0, -1))
+    clearError()
+  }, [clearError])
+
+  // ── PASO 1: validar slug y cargar establecimientos ────────────────────────
   const handleSlugSubmit = useCallback(async () => {
     const trimmed = tenantSlug.trim().toLowerCase()
     if (!trimmed) {
@@ -235,14 +300,14 @@ export default function LoginScreen() {
         return
       }
 
-      // Guardar el slug para la próxima vez
-      await SecureStore.setItemAsync(SLUG_STORAGE_KEY, trimmed)
+      // Guardar slug para la próxima vez (AsyncStorage — dato público)
+      await AsyncStorage.setItem(SLUG_STORAGE_KEY, trimmed)
       setTenantSlug(trimmed)
       setEstablishments(ests)
 
-      // Si solo hay un establecimiento, seleccionarlo automáticamente
+      // Si solo hay un establecimiento, saltar directamente al PIN
       if (ests.length === 1) {
-        setSelectedEstId(ests[0].id)
+        setSelectedEstId(ests[0]!.id)
         setStep('PIN')
       } else {
         setStep('ESTABLISHMENT')
@@ -254,48 +319,19 @@ export default function LoginScreen() {
     }
   }, [tenantSlug])
 
-  // ── PASO 2: seleccionar establecimiento ───────────────────────────────────
+  // ── PASO 2: seleccionar establecimiento ──────────────────────────────────
   const handleEstablishmentSelect = useCallback((id: string) => {
     setSelectedEstId(id)
     setStep('PIN')
   }, [])
 
-  // ── PASO 3: manejo del PIN ────────────────────────────────────────────────
-  const handlePinKey = useCallback((digit: string) => {
-    if (pin.length >= PIN_LENGTH) return
-    const newPin = pin + digit
-    setPin(newPin)
-
-    // Auto-submit cuando se completan los 4 dígitos
-    if (newPin.length === PIN_LENGTH) {
-      handlePinSubmit(newPin)
-    }
-  }, [pin])
-
-  const handlePinDelete = useCallback(() => {
-    setPin(prev => prev.slice(0, -1))
-    clearError()
-  }, [])
-
-  const handlePinSubmit = useCallback(async (submittedPin: string) => {
-    if (!selectedEstId) return
-
-    try {
-      await login(tenantSlug, submittedPin, selectedEstId)
-      // Si el login tiene éxito, la navegación la maneja el root layout
-      // al detectar que isAuthenticated cambió a true
-    } catch {
-      // El error ya está en el store — el useEffect de shake lo detecta
-    }
-  }, [tenantSlug, selectedEstId, login])
-
-  // ── Volver al paso anterior ────────────────────────────────────────────────
+  // ── Volver al paso anterior ───────────────────────────────────────────────
   const handleBack = useCallback(() => {
     clearError()
     setPin('')
-    if (step === 'PIN')          setStep(establishments.length > 1 ? 'ESTABLISHMENT' : 'SLUG')
+    if (step === 'PIN')           setStep(establishments.length > 1 ? 'ESTABLISHMENT' : 'SLUG')
     if (step === 'ESTABLISHMENT') setStep('SLUG')
-  }, [step, establishments.length])
+  }, [step, establishments.length, clearError])
 
   // ==========================================================================
   // RENDER
@@ -314,7 +350,7 @@ export default function LoginScreen() {
       >
         <View className="flex-1 px-6 pt-16 pb-8">
 
-          {/* ── Header ─────────────────────────────────────────────────── */}
+          {/* ── Header ────────────────────────────────────────────────── */}
           <View className="items-center mb-10">
             <View className="w-16 h-16 bg-blue-600 rounded-2xl items-center justify-center mb-4">
               <Text className="text-white text-3xl font-bold">T</Text>
@@ -323,7 +359,7 @@ export default function LoginScreen() {
             <Text className="text-slate-500 text-sm mt-1">Sistema de Punto de Venta</Text>
           </View>
 
-          {/* ── PASO 1: Ingreso del slug ────────────────────────────────── */}
+          {/* ── PASO 1: Ingreso del slug ───────────────────────────────── */}
           {step === 'SLUG' && (
             <View className="flex-1">
               <Text className="text-lg font-semibold text-slate-700 mb-2">
@@ -378,7 +414,7 @@ export default function LoginScreen() {
             </View>
           )}
 
-          {/* ── PASO 2: Selección de establecimiento ───────────────────── */}
+          {/* ── PASO 2: Selección de establecimiento ──────────────────── */}
           {step === 'ESTABLISHMENT' && (
             <View className="flex-1">
               <Text className="text-lg font-semibold text-slate-700 mb-2">
@@ -405,7 +441,7 @@ export default function LoginScreen() {
             </View>
           )}
 
-          {/* ── PASO 3: Teclado de PIN ──────────────────────────────────── */}
+          {/* ── PASO 3: Teclado de PIN ─────────────────────────────────── */}
           {step === 'PIN' && (
             <View className="flex-1">
               <View className="items-center mb-2">
@@ -439,19 +475,19 @@ export default function LoginScreen() {
               <View className="mt-2">
                 {/* Fila 1-2-3 */}
                 <View className="flex-row">
-                  {['1','2','3'].map(d => (
+                  {(['1','2','3'] as const).map(d => (
                     <PinKey key={d} label={d} onPress={() => handlePinKey(d)} />
                   ))}
                 </View>
                 {/* Fila 4-5-6 */}
                 <View className="flex-row">
-                  {['4','5','6'].map(d => (
+                  {(['4','5','6'] as const).map(d => (
                     <PinKey key={d} label={d} onPress={() => handlePinKey(d)} />
                   ))}
                 </View>
                 {/* Fila 7-8-9 */}
                 <View className="flex-row">
-                  {['7','8','9'].map(d => (
+                  {(['7','8','9'] as const).map(d => (
                     <PinKey key={d} label={d} onPress={() => handlePinKey(d)} />
                   ))}
                 </View>
