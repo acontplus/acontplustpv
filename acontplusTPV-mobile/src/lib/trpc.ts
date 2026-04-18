@@ -11,22 +11,28 @@
 //   - Expo/React Native soporta batch nativamente
 // =============================================================================
 
-import { createTRPCReact }              from '@trpc/react-query'
+import { createTRPCReact }                from '@trpc/react-query'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
+import type { AnyRouter }                  from '@trpc/server'
 import Constants                           from 'expo-constants'
 import { useAuthStore }                    from '../store/auth'
 
-// El tipo AppRouter está definido en src/types/router.ts como un objeto de
-// descripción de procedimientos (input/output). No es un Router de tRPC en
-// sentido estricto (no tiene _def, createCaller, etc.), por lo que no puede
-// pasarse directamente a createTRPCReact<T>.
+// =============================================================================
+// TIPO SHIM PARA REPOS SEPARADOS — tRPC v11
 //
-// Solución: instanciar con `any` para que tRPC no valide el constraint,
-// y mantener el tipo manual en router.ts solo como documentación/referencia.
-// En un monorepo con acceso al backend, se usaría `typeof appRouter` directamente.
+// createTRPCReact<T> requiere T extends AnyRouter, donde:
+//   AnyRouter = Router<any, any>
+//   Router tiene: _def: RouterDef<...> y createCaller
+//
+// En un monorepo se pasaría `typeof appRouter` directamente.
+// En repos separados construimos un shim mínimo que satisface el constraint
+// sin importar código de ejecución del backend.
 //
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export const trpc = createTRPCReact<any>()
+type RouterShim = AnyRouter
+
+// ── Instancia de tRPC para React (hooks) ────────────────────────────────────
+export const trpc = createTRPCReact<RouterShim>()
 
 // ── Obtener la URL base de la API ────────────────────────────────────────────
 function getApiUrl(): string {
@@ -113,8 +119,7 @@ function createTrpcLink() {
 // Por ejemplo: en el auth store, en initPowerSync, etc.
 // =============================================================================
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export const trpcVanilla = createTRPCClient<any>({
+export const trpcVanilla = createTRPCClient<RouterShim>({
   links: [createTrpcLink()],
 })
 
