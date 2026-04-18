@@ -13,23 +13,30 @@
 
 import { createTRPCReact }                from '@trpc/react-query'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
-import type { AnyRouter }                  from '@trpc/server'
+import type {
+  AnyRootTypes,
+  RouterRecord,
+  Router,
+}                                          from '@trpc/server/unstable-core-do-not-import'
 import Constants                           from 'expo-constants'
 import { useAuthStore }                    from '../store/auth'
 
 // =============================================================================
 // TIPO SHIM PARA REPOS SEPARADOS — tRPC v11
 //
-// createTRPCReact<T> requiere T extends AnyRouter, donde:
-//   AnyRouter = Router<any, any>
-//   Router tiene: _def: RouterDef<...> y createCaller
+// createTRPCReact<T> requiere T extends AnyRouter = Router<any, any>.
+// Con Router<any, any>, _def.record es `any`, y ProtectedIntersection
+// lo evalúa como potencialmente conflictivo con sus métodos internos
+// (Provider, useContext, useUtils, createClient) generando errores de tipo.
 //
-// En un monorepo se pasaría `typeof appRouter` directamente.
-// En repos separados construimos un shim mínimo que satisface el constraint
-// sin importar código de ejecución del backend.
+// Solución: usar Router<AnyRootTypes, RouterRecord> donde RouterRecord = {}
+// (record vacío). Esto satisface el constraint sin producir colisiones porque
+// un record vacío no tiene propiedades que colisionen con los métodos internos.
 //
+// En un monorepo se pasaría `typeof appRouter` directamente — que tiene el
+// record real con todos los procedimientos tipados.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-type RouterShim = AnyRouter
+type RouterShim = Router<AnyRootTypes, RouterRecord>
 
 // ── Instancia de tRPC para React (hooks) ────────────────────────────────────
 export const trpc = createTRPCReact<RouterShim>()
