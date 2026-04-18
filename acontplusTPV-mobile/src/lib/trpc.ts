@@ -13,33 +13,26 @@
 
 import { createTRPCReact }                from '@trpc/react-query'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
-import type {
-  AnyRootTypes,
-  RouterRecord,
-  Router,
-}                                          from '@trpc/server/unstable-core-do-not-import'
 import Constants                           from 'expo-constants'
 import { useAuthStore }                    from '../store/auth'
 
 // =============================================================================
-// TIPO SHIM PARA REPOS SEPARADOS — tRPC v11
+// INSTANCIA tRPC — ESTRATEGIA PARA REPOS SEPARADOS EN tRPC v11
 //
-// createTRPCReact<T> requiere T extends AnyRouter = Router<any, any>.
-// Con Router<any, any>, _def.record es `any`, y ProtectedIntersection
-// lo evalúa como potencialmente conflictivo con sus métodos internos
-// (Provider, useContext, useUtils, createClient) generando errores de tipo.
+// createTRPCReact<T> aplica ProtectedIntersection que rechaza cualquier tipo
+// con `any` en su cadena (_def.record) — incluyendo AnyRouter, Router<any,any>
+// y cualquier variante con RouterRecord vacío porque AnyRootTypes contiene any.
 //
-// Solución: usar Router<AnyRootTypes, RouterRecord> donde RouterRecord = {}
-// (record vacío). Esto satisface el constraint sin producir colisiones porque
-// un record vacío no tiene propiedades que colisionen con los métodos internos.
+// Solución: instanciar sin genérico (inferido como never internamente) y
+// castear a `any` para obtener un cliente funcional en runtime.
+// Los hooks (trpc.auth.login.useMutation, etc.) funcionan en runtime porque
+// tRPC usa proxies — no necesita el tipo en tiempo de ejecución.
 //
-// En un monorepo se pasaría `typeof appRouter` directamente — que tiene el
-// record real con todos los procedimientos tipados.
+// En un monorepo con acceso al backend se usaría `typeof appRouter`
+// directamente, que tiene tipos concretos sin `any` en la cadena.
+//
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-type RouterShim = Router<AnyRootTypes, RouterRecord>
-
-// ── Instancia de tRPC para React (hooks) ────────────────────────────────────
-export const trpc = createTRPCReact<RouterShim>()
+export const trpc = createTRPCReact() as any
 
 // ── Obtener la URL base de la API ────────────────────────────────────────────
 function getApiUrl(): string {
@@ -126,7 +119,8 @@ function createTrpcLink() {
 // Por ejemplo: en el auth store, en initPowerSync, etc.
 // =============================================================================
 
-export const trpcVanilla = createTRPCClient<RouterShim>({
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const trpcVanilla = createTRPCClient<any>({
   links: [createTrpcLink()],
 })
 
