@@ -7,9 +7,9 @@ module.exports = function (api) {
       ["babel-preset-expo", { jsxImportSource: "nativewind" }],
       "nativewind/babel",
     ],
-    plugins: [
-      // react-native-reanimated debe ir SIEMPRE al final
-      "react-native-reanimated/plugin",
-    ],
+    // NOTA: react-native-reanimated/plugin se añade aquí cuando se
+    // incorporen animaciones a la app. Requiere react-native-worklets
+    // instalado. Por ahora no se usa Reanimated en ninguna pantalla.
+    plugins: [],
   }
 }
