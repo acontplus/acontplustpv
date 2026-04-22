@@ -2,34 +2,20 @@
 // app/(app)/_layout.tsx
 // App Layout — Auth Guard + Tabs condicionales por rol
 //
-// DOBLE GUARD (dos condiciones para operar):
-//   1. isAuthenticated  → ¿hay sesión válida?
-//      Si no → redirect a /(auth)/login
+// DOBLE GUARD:
+//   1. isAuthenticated  → Si no → redirect a /(auth)/login
+//   2. businessDayId    → Si no (WAITER/BARMAN) → pantalla de bloqueo
 //
-//   2. businessDayId    → ¿hay jornada abierta?
-//      Si no → pantalla de bloqueo "Jornada cerrada"
-//      (no redirect — la app debe mantenerse en primer plano para cuando
-//       el admin abra la jornada y PowerSync sincronice el businessDayId)
+// TABS POR ROL — modelo bar sin mesas fijas:
+//   WAITER:           [Pedidos, Perfil]
+//   BARMAN:           [Pedidos, Perfil]
+//   CASHIER:          [Pedidos, Caja, Perfil]
+//   ADMIN:            [Pedidos, Caja, Jornada, Perfil]
 //
-// Por qué el guard de jornada NO hace redirect:
-//   El documento maestro establece que el servidor rechaza transacciones
-//   con businessDayId de jornadas cerradas. Si el mesero no tiene jornada
-//   activa, no puede crear pedidos de ningún modo. La pantalla de bloqueo
-//   es el UX correcto: el mesero espera hasta que el admin (CASHIER/ADMIN)
-//   abra la jornada desde su dispositivo. PowerSync sincronizará el nuevo
-//   businessDayId automáticamente y el Guard desbloqueará la UI.
-//
-// TABS CONDICIONALES POR ROL:
-//   La estructura de tabs se adapta al rol del usuario logueado.
-//   Esto evita tener que refactorizar _layout.tsx en el Sprint 3.
-//
-//   WAITER:           [Mesas, Perfil]
-//   CASHIER / BARMAN: [Pedidos, Caja, Perfil]
-//   ADMIN:            [Mesas, Pedidos, Caja, Jornada, Perfil]
-//
-// NOTA SOBRE IMPORTS:
-//   Desde app/(app)/ los imports hacia src/ usan '../../src/...'
-//   (subir dos niveles: salir de (app)/ y luego de app/)
+// "Pedidos" es la pantalla principal para TODOS los roles:
+//   - WAITER ve sus pedidos activos + botón de nuevo pedido
+//   - BARMAN ve todos los pedidos de la jornada + confirmar despacho
+//   - CASHIER ve pedidos en AWAITING_PAYMENT para cobrar
 // =============================================================================
 
 import { Redirect, Tabs }                    from 'expo-router'
@@ -45,8 +31,6 @@ import {
 
 // =============================================================================
 // PANTALLA DE BLOQUEO — jornada cerrada
-// Se muestra cuando el usuario está autenticado pero no hay jornada abierta.
-// No es una ruta — es un componente inline para mantener el árbol de providers.
 // =============================================================================
 
 function JornadaCerradaScreen() {
@@ -84,58 +68,44 @@ function JornadaCerradaScreen() {
 }
 
 // =============================================================================
-// COMPONENTE DE TABS — configuración condicional por rol
+// TABS
 // =============================================================================
 
 function AppTabs() {
   const roles = useAuthStore(selectRoles)
 
   const isAdmin   = roles.includes('ADMIN')
-  const isCashier = roles.some(r => r === 'ADMIN' || r === 'CASHIER' || r === 'BARMAN')
-  const isWaiter  = roles.includes('WAITER')
+  const isCashier = roles.some(r => r === 'ADMIN' || r === 'CASHIER')
 
   return (
     <Tabs
       screenOptions={{
         headerShown:            false,
         tabBarStyle: {
-          backgroundColor:      '#1e293b',  // slate-800
-          borderTopColor:       '#334155',  // slate-700
+          backgroundColor:      '#1e293b',
+          borderTopColor:       '#334155',
           borderTopWidth:       1,
         },
-        tabBarActiveTintColor:   '#3b82f6',  // blue-500
-        tabBarInactiveTintColor: '#64748b',  // slate-500
+        tabBarActiveTintColor:   '#3b82f6',
+        tabBarInactiveTintColor: '#64748b',
         tabBarLabelStyle: {
           fontSize:   11,
           fontWeight: '600',
         },
       }}
     >
-      {/* ── Tab: Mesas — WAITER y ADMIN ── */}
+      {/* ── Pedidos — todos los roles ── */}
       <Tabs.Screen
         name="index"
-        options={{
-          title: 'Mesas',
-          tabBarIcon: ({ color }) => (
-            <Text style={{ color, fontSize: 20 }}>🪑</Text>
-          ),
-          href: isAdmin || isWaiter ? undefined : null,
-        }}
-      />
-
-      {/* ── Tab: Pedidos — CASHIER, BARMAN y ADMIN ── */}
-      <Tabs.Screen
-        name="orders"
         options={{
           title: 'Pedidos',
           tabBarIcon: ({ color }) => (
             <Text style={{ color, fontSize: 20 }}>📋</Text>
           ),
-          href: isCashier ? undefined : null,
         }}
       />
 
-      {/* ── Tab: Caja — CASHIER y ADMIN ── */}
+      {/* ── Caja — CASHIER y ADMIN ── */}
       <Tabs.Screen
         name="cashier"
         options={{
@@ -143,11 +113,11 @@ function AppTabs() {
           tabBarIcon: ({ color }) => (
             <Text style={{ color, fontSize: 20 }}>💰</Text>
           ),
-          href: roles.some(r => r === 'ADMIN' || r === 'CASHIER') ? undefined : null,
+          href: isCashier ? undefined : null,
         }}
       />
 
-      {/* ── Tab: Jornada — solo ADMIN ── */}
+      {/* ── Jornada — solo ADMIN ── */}
       <Tabs.Screen
         name="business-day"
         options={{
@@ -159,7 +129,7 @@ function AppTabs() {
         }}
       />
 
-      {/* ── Tab: Perfil — universal ── */}
+      {/* ── Perfil — universal ── */}
       <Tabs.Screen
         name="profile"
         options={{
@@ -168,6 +138,16 @@ function AppTabs() {
             <Text style={{ color, fontSize: 20 }}>👤</Text>
           ),
         }}
+      />
+
+      {/* Rutas sin tab — accesibles por navegación pero no visibles en la barra */}
+      <Tabs.Screen
+        name="orders"
+        options={{ href: null }}
+      />
+      <Tabs.Screen
+        name="new-order"
+        options={{ href: null }}
       />
     </Tabs>
   )
@@ -182,15 +162,10 @@ export default function AppLayout() {
   const businessDayId   = useAuthStore(selectBusinessDayId)
   const roles           = useAuthStore(selectRoles)
 
-  // ── Guard 1: autenticación ────────────────────────────────────────────────
   if (!isAuthenticated) {
     return <Redirect href="/(auth)/login" />
   }
 
-  // ── Guard 2: jornada activa ───────────────────────────────────────────────
-  // ADMIN y CASHIER pueden pasar sin jornada — ellos la abren.
-  // WAITER y BARMAN quedan bloqueados hasta que PowerSync sincronice
-  // el businessDayId de la jornada que abrió el cajero.
   const canOpenDay = roles.some(r => r === 'ADMIN' || r === 'CASHIER')
 
   if (!businessDayId && !canOpenDay) {

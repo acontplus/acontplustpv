@@ -1,34 +1,193 @@
 // =============================================================================
 // app/(app)/index.tsx
-// Pantalla principal — Vista de Mesas (Sprint 2: placeholder funcional)
+// Pantalla principal — Lista de pedidos activos (Sprint 3)
 //
-// CORRECCIÓN DEFINITIVA — warning "The result of getSnapshot should be cached":
-//   Eliminado usePowerSyncStatus() del SDK por completo.
-//   Suscripción directa al singleton powerSyncDb via registerListener().
-//   Estado local useState con primitivos booleanos — sin useSyncExternalStore.
+// MODELO DE NEGOCIO — Bar sin mesas fijas:
+//   No hay grilla de mesas. La pantalla principal muestra los pedidos
+//   activos de la jornada, filtrados según el rol:
+//
+//   WAITER:          sus pedidos (PowerSync solo le sincroniza los suyos)
+//   BARMAN / ADMIN:  todos los pedidos de la jornada
+//   CASHIER:         pedidos en AWAITING_PAYMENT para cobrar
+//
+// IDENTIFICACIÓN DEL PEDIDO:
+//   Sin mesa → identificado por order_number (asignado al confirmar)
+//   Con mesa → identificado por table_alias + order_number
+//   En DRAFT → identificado por local_sequence (aún sin número definitivo)
+//
+// ESTADOS VISIBLES:
+//   DRAFT            → creado pero no enviado al barman
+//   CONFIRMED        → barman lo recibió y está preparando
+//   SERVED           → entregado al cliente
+//   AWAITING_PAYMENT → cliente quiere pagar
+//   CREDIT_REQUESTED → pago por crédito solicitado
+//
+// FLUJO DE NUEVO PEDIDO — Sprint 4:
+//   El botón FAB "+" abre la pantalla de selección de catálogo
+//   donde el mesero/barman arma el pedido y lo confirma.
 // =============================================================================
 
-import { useCallback, useState, useEffect } from 'react'
+import { router } from 'expo-router';
+import { useState, useEffect, useCallback } from 'react'
 import {
   View,
   Text,
   TouchableOpacity,
-  ScrollView,
+  FlatList,
   ActivityIndicator,
+  RefreshControl,
   Alert,
-}                                   from 'react-native'
-import { StatusBar }                from 'expo-status-bar'
+}                                    from 'react-native'
+import { StatusBar }                 from 'expo-status-bar'
+import { useQuery }                  from '@powersync/react'
 
+import { useBusinessDay }            from '../../src/hooks/useBusinessDay'
 import {
   useAuthStore,
   selectUser,
   selectRoles,
   selectBusinessDayId,
-}                                   from '../../src/store/auth'
-import { powerSyncDb }              from '../../src/lib/powersync'
+}                                    from '../../src/store/auth'
+import { powerSyncDb }               from '../../src/lib/powersync'
 
 // =============================================================================
-// HOOK: estado de conexión PowerSync sin useSyncExternalStore
+// TIPOS
+// =============================================================================
+
+interface OrderRow {
+  id:                  string
+  order_number:        string | null
+  local_sequence:      string
+  status:              string
+  print_status:        string
+  table_alias:         string | null
+  total_amount:        number
+  notes:               string | null
+  created_at:          string
+  updated_at:          string
+  created_by_user_id:  string | null
+  item_count:          number
+}
+
+// =============================================================================
+// HELPERS VISUALES
+// =============================================================================
+
+const STATUS_CONFIG: Record<string, {
+  label:   string
+  bg:      string
+  border:  string
+  badge:   string
+  text:    string
+}> = {
+  DRAFT: {
+    label:  'Borrador',
+    bg:     'bg-slate-800',
+    border: 'border-slate-600',
+    badge:  'bg-slate-600',
+    text:   'text-slate-300',
+  },
+  CONFIRMED: {
+    label:  'En preparación',
+    bg:     'bg-blue-900/40',
+    border: 'border-blue-700/60',
+    badge:  'bg-blue-600',
+    text:   'text-blue-200',
+  },
+  SERVED: {
+    label:  'Entregado',
+    bg:     'bg-emerald-900/40',
+    border: 'border-emerald-700/60',
+    badge:  'bg-emerald-600',
+    text:   'text-emerald-200',
+  },
+  AWAITING_PAYMENT: {
+    label:  'Por cobrar',
+    bg:     'bg-amber-900/40',
+    border: 'border-amber-700/60',
+    badge:  'bg-amber-500',
+    text:   'text-amber-200',
+  },
+  CREDIT_REQUESTED: {
+    label:  'Crédito solicitado',
+    bg:     'bg-purple-900/40',
+    border: 'border-purple-700/60',
+    badge:  'bg-purple-600',
+    text:   'text-purple-200',
+  },
+}
+
+function getStatusConfig(status: string) {
+  return STATUS_CONFIG[status] ?? STATUS_CONFIG['DRAFT']!
+}
+
+// Hora formateada desde ISO string
+function formatTime(iso: string): string {
+  try {
+    return new Date(iso).toLocaleTimeString('es-EC', {
+      hour:   '2-digit',
+      minute: '2-digit',
+      timeZone: 'America/Guayaquil',
+    })
+  } catch {
+    return '—'
+  }
+}
+
+// =============================================================================
+// HOOK: pedidos activos desde PowerSync SQLite
+// =============================================================================
+
+const ACTIVE_STATUSES = `'DRAFT','CONFIRMED','SERVED','AWAITING_PAYMENT','CREDIT_REQUESTED'`
+
+function useActiveOrders(businessDayId: string | null, userId: string | null, isWaiter: boolean) {
+  // WAITER: solo sus pedidos (PowerSync ya filtra por sync-rules,
+  //         pero filtramos también en SQLite por seguridad y rendimiento)
+  // BARMAN/CASHIER/ADMIN: todos los pedidos de la jornada activa
+  const sql = isWaiter
+    ? `SELECT
+         o.id, o.order_number, o.local_sequence, o.status, o.print_status,
+         o.table_alias, o.total_amount, o.notes, o.created_at, o.updated_at,
+         o.created_by_user_id,
+         COUNT(oi.id) AS item_count
+       FROM "Order" o
+       LEFT JOIN "OrderItem" oi ON oi.order_id = o.id
+       WHERE o.business_day_id = ?
+         AND o.created_by_user_id = ?
+         AND o.status IN (${ACTIVE_STATUSES})
+       GROUP BY o.id
+       ORDER BY o.created_at DESC`
+    : `SELECT
+         o.id, o.order_number, o.local_sequence, o.status, o.print_status,
+         o.table_alias, o.total_amount, o.notes, o.created_at, o.updated_at,
+         o.created_by_user_id,
+         COUNT(oi.id) AS item_count
+       FROM "Order" o
+       LEFT JOIN "OrderItem" oi ON oi.order_id = o.id
+       WHERE o.business_day_id = ?
+         AND o.status IN (${ACTIVE_STATUSES})
+       GROUP BY o.id
+       ORDER BY
+         CASE o.status
+           WHEN 'AWAITING_PAYMENT' THEN 1
+           WHEN 'CONFIRMED'        THEN 2
+           WHEN 'SERVED'           THEN 3
+           WHEN 'DRAFT'            THEN 4
+           ELSE 5
+         END,
+         o.created_at ASC`
+
+  const params = isWaiter
+    ? [businessDayId ?? '', userId ?? '']
+    : [businessDayId ?? '']
+
+  const { data, isLoading } = useQuery<OrderRow>(sql, params)
+
+  return { orders: data ?? [], isLoading }
+}
+
+// =============================================================================
+// BADGE DE SYNC (reutilizado del Sprint 2)
 // =============================================================================
 
 type SyncStatus = { connected: boolean; syncing: boolean }
@@ -41,172 +200,247 @@ function usePowerSyncConnected(): SyncStatus {
 
   useEffect(() => {
     setStatus({ connected: powerSyncDb.connected === true, syncing: false })
-
-    const unsubscribe = powerSyncDb.registerListener({
-      statusChanged: (s) => {
-        setStatus({
-          connected: s.connected                         === true,
-          syncing:   (s.dataFlowStatus?.downloading     === true) ||
-                     (s.dataFlowStatus?.uploading       === true),
-        })
-      },
+    const unsub = powerSyncDb.registerListener({
+      statusChanged: (s) => setStatus({
+        connected: s.connected === true,
+        syncing:   (s.dataFlowStatus?.downloading === true) ||
+                   (s.dataFlowStatus?.uploading   === true),
+      }),
     })
-
-    return () => { unsubscribe() }
+    return () => { unsub() }
   }, [])
 
   return status
 }
 
-// =============================================================================
-// BADGE DE ESTADO
-// =============================================================================
-
-function PowerSyncStatusBadge() {
+function SyncBadge() {
   const { connected, syncing } = usePowerSyncConnected()
-
-  if (connected && !syncing) {
-    return (
-      <View className="flex-row items-center gap-1.5 bg-emerald-500/20 px-3 py-1.5 rounded-full">
-        <View className="w-2 h-2 rounded-full bg-emerald-500" />
-        <Text className="text-emerald-400 text-xs font-semibold">Sincronizado</Text>
-      </View>
-    )
-  }
-
-  if (syncing) {
-    return (
-      <View className="flex-row items-center gap-1.5 bg-blue-500/20 px-3 py-1.5 rounded-full">
-        <ActivityIndicator size={10} color="#60a5fa" />
-        <Text className="text-blue-400 text-xs font-semibold">Sincronizando...</Text>
-      </View>
-    )
-  }
-
+  if (connected && !syncing) return (
+    <View className="flex-row items-center gap-1 bg-emerald-500/20 px-2 py-1 rounded-full">
+      <View className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+      <Text className="text-emerald-400 text-xs">Sync</Text>
+    </View>
+  )
+  if (syncing) return (
+    <View className="flex-row items-center gap-1 bg-blue-500/20 px-2 py-1 rounded-full">
+      <ActivityIndicator size={8} color="#60a5fa" />
+      <Text className="text-blue-400 text-xs">Sync...</Text>
+    </View>
+  )
   return (
-    <View className="flex-row items-center gap-1.5 bg-slate-700 px-3 py-1.5 rounded-full">
-      <View className="w-2 h-2 rounded-full bg-slate-500" />
-      <Text className="text-slate-400 text-xs font-semibold">Sin conexión</Text>
+    <View className="flex-row items-center gap-1 bg-slate-700 px-2 py-1 rounded-full">
+      <View className="w-1.5 h-1.5 rounded-full bg-slate-500" />
+      <Text className="text-slate-400 text-xs">Sin red</Text>
     </View>
   )
 }
 
 // =============================================================================
-// LABEL DE ROL
+// COMPONENTE: Tarjeta de pedido
 // =============================================================================
 
-const ROLE_LABELS: Record<string, { label: string; color: string }> = {
-  ADMIN:   { label: 'Administrador', color: 'bg-purple-500/20 text-purple-300'   },
-  CASHIER: { label: 'Cajero',        color: 'bg-blue-500/20 text-blue-300'       },
-  BARMAN:  { label: 'Barman',        color: 'bg-amber-500/20 text-amber-300'     },
-  WAITER:  { label: 'Mesero',        color: 'bg-emerald-500/20 text-emerald-300' },
+interface OrderCardProps {
+  order:   OrderRow
+  onPress: (order: OrderRow) => void
+}
+
+function OrderCard({ order, onPress }: OrderCardProps) {
+  const cfg = getStatusConfig(order.status)
+
+  // Identificador visible: número de pedido si existe, si no el local_sequence
+  const displayId = order.order_number
+    ? `#${order.order_number}`
+    : `~${order.local_sequence.slice(-6).toUpperCase()}`
+
+  return (
+    <TouchableOpacity
+      onPress={() => onPress(order)}
+      className={`rounded-2xl p-4 border mb-3 ${cfg.bg} ${cfg.border}`}
+      activeOpacity={0.75}
+    >
+      <View className="flex-row items-start justify-between mb-2">
+        {/* Identificador + mesa */}
+        <View>
+          <Text className={`text-xl font-bold ${cfg.text}`}>
+            {displayId}
+          </Text>
+          {order.table_alias ? (
+            <Text className={`text-xs mt-0.5 ${cfg.text} opacity-70`}>
+              Mesa: {order.table_alias}
+            </Text>
+          ) : null}
+        </View>
+
+        {/* Badge de estado */}
+        <View className={`px-2.5 py-1 rounded-full ${cfg.badge}`}>
+          <Text className="text-white text-xs font-semibold">
+            {cfg.label}
+          </Text>
+        </View>
+      </View>
+
+      <View className="flex-row items-center justify-between mt-1">
+        {/* Items y total */}
+        <Text className={`text-sm ${cfg.text} opacity-60`}>
+          {order.item_count} {order.item_count === 1 ? 'ítem' : 'ítems'}
+        </Text>
+        <Text className={`text-base font-bold ${cfg.text}`}>
+          ${Number(order.total_amount).toFixed(2)}
+        </Text>
+      </View>
+
+      {/* Hora y notas */}
+      <View className="flex-row items-center justify-between mt-1.5">
+        <Text className={`text-xs ${cfg.text} opacity-40`}>
+          {formatTime(order.created_at)}
+        </Text>
+        {order.notes ? (
+          <Text className={`text-xs ${cfg.text} opacity-50`} numberOfLines={1}>
+            📝 {order.notes}
+          </Text>
+        ) : null}
+      </View>
+    </TouchableOpacity>
+  )
 }
 
 // =============================================================================
-// COMPONENTE PRINCIPAL
+// PANTALLA PRINCIPAL
 // =============================================================================
 
-export default function IndexScreen() {
+export default function OrdersScreen() {
   const user          = useAuthStore(selectUser)
   const roles         = useAuthStore(selectRoles)
   const businessDayId = useAuthStore(selectBusinessDayId)
-  const logout        = useAuthStore(s => s.logout)
 
-  const primaryRole = (['ADMIN', 'CASHIER', 'BARMAN', 'WAITER'] as const)
-    .find(r => roles.includes(r)) ?? 'WAITER'
-  const roleInfo = ROLE_LABELS[primaryRole] ?? ROLE_LABELS['WAITER']!
+  // Sincroniza businessDayId al store automáticamente
+  useBusinessDay()
 
-  const handleLogout = useCallback(() => {
+  const isWaiter   = roles.includes('WAITER') && !roles.includes('ADMIN') && !roles.includes('CASHIER') && !roles.includes('BARMAN')
+  const isCashier  = roles.some(r => r === 'ADMIN' || r === 'CASHIER')
+
+  const { orders, isLoading } = useActiveOrders(
+    businessDayId,
+    user?.id ?? null,
+    isWaiter,
+  )
+
+  const [refreshing, setRefreshing] = useState(false)
+
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true)
+    await new Promise(r => setTimeout(r, 600))
+    setRefreshing(false)
+  }, [])
+
+  const handleOrderPress = useCallback((order: OrderRow) => {
+    // Sprint 4: navegar a detalle/acciones del pedido
     Alert.alert(
-      'Cerrar sesión',
-      '¿Estás seguro? Se borrarán los datos locales de este dispositivo.',
-      [
-        { text: 'Cancelar', style: 'cancel' },
-        { text: 'Cerrar sesión', style: 'destructive', onPress: async () => { await logout() } },
-      ],
+      order.order_number ? `Pedido #${order.order_number}` : 'Pedido en borrador',
+      `Estado: ${getStatusConfig(order.status).label}\nTotal: $${Number(order.total_amount).toFixed(2)}`,
+      [{ text: 'Cerrar' }],
     )
-  }, [logout])
+  }, [])
+
+  // Contadores por estado para el header
+  const awaitingCount  = orders.filter(o => o.status === 'AWAITING_PAYMENT').length
+  const confirmedCount = orders.filter(o => o.status === 'CONFIRMED').length
 
   return (
     <View className="flex-1 bg-slate-900">
       <StatusBar style="light" />
 
-      {/* ── Header ──────────────────────────────────────────────────── */}
-      <View className="px-6 pt-14 pb-4 bg-slate-800 border-b border-slate-700">
+      {/* Header */}
+      <View className="px-6 pt-14 pb-3 bg-slate-800 border-b border-slate-700">
         <View className="flex-row items-center justify-between">
-          <View className="flex-1">
-            <Text className="text-slate-400 text-xs mb-0.5">Bienvenido</Text>
-            <Text className="text-white text-lg font-bold" numberOfLines={1}>
-              {user?.name ?? 'Usuario'}
+          <View>
+            <Text className="text-white text-xl font-bold">Pedidos</Text>
+            <Text className="text-slate-400 text-xs mt-0.5">
+              {user?.name ?? ''}
             </Text>
-            <View className={`mt-1.5 self-start px-2.5 py-0.5 rounded-full ${roleInfo.color}`}>
-              <Text className="text-xs font-semibold">{roleInfo.label}</Text>
-            </View>
           </View>
-          <PowerSyncStatusBadge />
+          <View className="flex-row items-center gap-2">
+            <SyncBadge />
+          </View>
         </View>
+
+        {/* Métricas */}
+        {orders.length > 0 && (
+          <View className="flex-row gap-4 mt-3">
+            <Text className="text-slate-400 text-xs">
+              <Text className="text-white font-bold">{orders.length}</Text> activos
+            </Text>
+            {confirmedCount > 0 && (
+              <Text className="text-slate-400 text-xs">
+                <Text className="text-blue-400 font-bold">{confirmedCount}</Text> en preparación
+              </Text>
+            )}
+            {awaitingCount > 0 && (
+              <Text className="text-slate-400 text-xs">
+                <Text className="text-amber-400 font-bold">{awaitingCount}</Text> por cobrar
+              </Text>
+            )}
+          </View>
+        )}
       </View>
 
-      <ScrollView className="flex-1" contentContainerStyle={{ padding: 24 }}>
-
-        {/* ── Estado de la jornada ──────────────────────────────────── */}
-        <View className={`rounded-2xl p-4 mb-6 border ${
-          businessDayId ? 'bg-emerald-900/30 border-emerald-700/50' : 'bg-amber-900/30 border-amber-700/50'
-        }`}>
-          <View className="flex-row items-center gap-2">
-            <Text className="text-xl">{businessDayId ? '✅' : '⏳'}</Text>
-            <View className="flex-1">
-              <Text className={`font-semibold text-sm ${businessDayId ? 'text-emerald-300' : 'text-amber-300'}`}>
-                {businessDayId ? 'Jornada activa' : 'Sin jornada activa'}
-              </Text>
-              <Text className={`text-xs mt-0.5 ${businessDayId ? 'text-emerald-500' : 'text-amber-500'}`}>
-                {businessDayId
-                  ? `ID: ${businessDayId.slice(0, 8)}...`
-                  : 'El administrador debe abrir la jornada'}
-              </Text>
-            </View>
-          </View>
-        </View>
-
-        {/* ── Placeholder de mesas ──────────────────────────────────── */}
-        <View className="bg-slate-800 rounded-2xl p-6 mb-6 items-center border border-slate-700">
-          <Text className="text-4xl mb-3">🪑</Text>
-          <Text className="text-white text-lg font-bold mb-2">Selecciona una mesa</Text>
-          <Text className="text-slate-400 text-sm text-center">
-            La grilla de mesas estará disponible en el Sprint 3.
-            Las mesas se cargarán desde la base de datos local de PowerSync.
+      {/* Aviso sin jornada para CASHIER/ADMIN */}
+      {!businessDayId && isCashier && (
+        <View className="mx-4 mt-4 p-3 bg-amber-900/30 rounded-xl border border-amber-700/50 flex-row items-center gap-2">
+          <Text className="text-amber-400">⚠️</Text>
+          <Text className="text-amber-300 text-xs flex-1">
+            Sin jornada activa. Ve a "Jornada" para abrirla.
           </Text>
         </View>
+      )}
 
-        {/* ── Info del sistema ──────────────────────────────────────── */}
-        <View className="bg-slate-800 rounded-2xl p-4 mb-6 border border-slate-700">
-          <Text className="text-slate-300 text-sm font-semibold mb-3">Estado del sistema</Text>
-          <View className="gap-2">
-            <View className="flex-row justify-between">
-              <Text className="text-slate-500 text-xs">Tenant</Text>
-              <Text className="text-slate-300 text-xs font-mono">{user?.tenantId?.slice(0, 8) ?? '—'}...</Text>
-            </View>
-            <View className="flex-row justify-between">
-              <Text className="text-slate-500 text-xs">Establecimiento</Text>
-              <Text className="text-slate-300 text-xs font-mono">{user?.establishmentId?.slice(0, 8) ?? '—'}...</Text>
-            </View>
-            <View className="flex-row justify-between">
-              <Text className="text-slate-500 text-xs">Roles activos</Text>
-              <Text className="text-slate-300 text-xs">{roles.join(', ')}</Text>
-            </View>
-          </View>
+      {/* Lista */}
+      {isLoading ? (
+        <View className="flex-1 items-center justify-center">
+          <ActivityIndicator size="large" color="#3b82f6" />
+          <Text className="text-slate-400 text-sm mt-3">Cargando pedidos...</Text>
         </View>
+      ) : (
+        <FlatList
+          data={orders}
+          keyExtractor={o => o.id}
+          renderItem={({ item }) => (
+            <OrderCard order={item} onPress={handleOrderPress} />
+          )}
+          contentContainerStyle={{ padding: 16, paddingBottom: 100 }}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={onRefresh}
+              tintColor="#3b82f6"
+            />
+          }
+          ListEmptyComponent={
+            <View className="items-center py-16">
+              <Text className="text-4xl mb-4">📋</Text>
+              <Text className="text-white text-lg font-bold mb-2">
+                Sin pedidos activos
+              </Text>
+              <Text className="text-slate-400 text-sm text-center">
+                {businessDayId
+                  ? 'Crea un nuevo pedido con el botón +'
+                  : 'Abre la jornada para comenzar a operar'}
+              </Text>
+            </View>
+          }
+        />
+      )}
 
-        {/* ── Logout ───────────────────────────────────────────────── */}
+      {/* FAB — Nuevo pedido (Sprint 4) */}
+      {businessDayId && (
         <TouchableOpacity
-          onPress={handleLogout}
-          className="bg-red-900/40 border border-red-800/60 rounded-2xl py-4 items-center mt-2"
-          activeOpacity={0.7}
+          onPress={() => router.push('/(app)/new-order')}
+          className="absolute bottom-8 right-6 w-14 h-14 bg-blue-600 rounded-full items-center justify-center shadow-lg active:bg-blue-700"
+          style={{ elevation: 6 }}
         >
-          <Text className="text-red-400 font-semibold text-base">Cerrar sesión</Text>
+          <Text className="text-white text-3xl font-light leading-none">+</Text>
         </TouchableOpacity>
-
-      </ScrollView>
+      )}
     </View>
   )
 }
