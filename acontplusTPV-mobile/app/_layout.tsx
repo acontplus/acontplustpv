@@ -1,3 +1,4 @@
+import '../global.css'
 // =============================================================================
 // app/_layout.tsx
 // Root Layout — Punto de entrada de la aplicación
