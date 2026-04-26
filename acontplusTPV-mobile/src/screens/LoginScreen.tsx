@@ -162,7 +162,8 @@ const PIN_LENGTH       = 4
 
 // Fetch de establecimientos sin tRPC (se llama antes del login, no hay token)
 async function fetchEstablishments(tenantSlug: string): Promise<Establishment[]> {
-  const apiUrl = Constants.expoConfig?.extra?.apiUrl ?? ''
+  //const apiUrl = Constants.expoConfig?.extra?.apiUrl ?? ''
+  const apiUrl = 'https://api.resuelveyaa.com'
 
   const res = await fetch(`${apiUrl}/trpc/auth.listEstablishments`, {
     method:  'POST',
