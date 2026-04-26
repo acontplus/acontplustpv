@@ -117,7 +117,13 @@ services:
         condition: service_healthy
     # Sin "ports" — la API NO está expuesta directamente; pasa por nginx
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:3000/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"
+        ]
       interval: 30s
       timeout:  10s
       retries:  3
@@ -147,7 +153,13 @@ services:
         condition: service_healthy
     # Sin "ports" — PowerSync NO está expuesto directamente; pasa por nginx
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/api/v1/status || exit 1"]
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:8080/probes/liveness').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"
+        ]
       interval: 30s
       timeout:  10s
       retries:  3

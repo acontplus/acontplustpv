@@ -16,8 +16,8 @@
     ]
   },
   extra: {
-    apiUrl: "https://api.tudominio.com",
-    powerSyncUrl: "https://powersync.tudominio.com"
+    apiUrl: "https://api.resuelveyaa.com",
+    powerSyncUrl: "https://powersync.resuelveyaa.com"
   },
   plugins: [
     "expo-router",
