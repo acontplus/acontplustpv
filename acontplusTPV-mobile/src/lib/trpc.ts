@@ -1,16 +1,22 @@
 import { createTRPCReact }                from '@trpc/react-query'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
+import Constants                           from 'expo-constants'
 import { useAuthStore }                    from '../store/auth'
 
 export const trpc = createTRPCReact() as any
 
 function getApiUrl(): string {
-  return 'https://api.resuelveyaa.com'
+  const apiUrl = Constants.expoConfig?.extra?.apiUrl
+  if (typeof apiUrl === 'string' && apiUrl.length > 0) {
+    return apiUrl
+  }
+  // Fallback local para no romper desarrollo si no existe app.config
+  return 'http://localhost:3000'
 }
 
 let isRefreshing = false
 let refreshPromise: Promise<string | null> | null = null
-const TRPC_DEBUG_NETWORK = true
+const TRPC_DEBUG_NETWORK = process.env.NODE_ENV !== 'production'
 const TRPC_FETCH_TIMEOUT_MS = 15000
 
 function createTrpcLink() {

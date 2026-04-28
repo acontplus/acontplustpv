@@ -23,15 +23,25 @@ import { prismaAuth }           from './lib/prisma'
 import jwt                      from 'jsonwebtoken'
 
 const POWERSYNC_SECRET = process.env.POWERSYNC_JWT_SECRET!
+const POWERSYNC_TOKEN_TTL_SEC = Number(process.env.POWERSYNC_TOKEN_TTL_SEC ?? '3600')
 
 if (!POWERSYNC_SECRET) {
   throw new Error('POWERSYNC_JWT_SECRET debe estar definido en las variables de entorno')
 }
+if (!Number.isFinite(POWERSYNC_TOKEN_TTL_SEC) || POWERSYNC_TOKEN_TTL_SEC <= 0) {
+  throw new Error('POWERSYNC_TOKEN_TTL_SEC debe ser un entero positivo')
+}
 
 export async function buildServer() {
+  const isProd = process.env.NODE_ENV === 'production'
+  const corsOrigins = process.env.CORS_ORIGINS?.split(',').map(s => s.trim()).filter(Boolean) ?? []
+  if (isProd && corsOrigins.length === 0) {
+    throw new Error('CORS_ORIGINS es obligatorio en producción')
+  }
+
   const app = Fastify({
     logger: {
-      level: process.env.NODE_ENV === 'production' ? 'warn' : 'info',
+      level: isProd ? 'warn' : 'info',
     },
   })
 
@@ -39,7 +49,7 @@ export async function buildServer() {
   // CORS
   // ---------------------------------------------------------------------------
   await app.register(cors, {
-    origin:      process.env.CORS_ORIGINS?.split(',') ?? ['http://localhost:3000'],
+    origin:      corsOrigins.length > 0 ? corsOrigins : ['http://localhost:3000'],
     credentials: true,
   })
 
@@ -101,7 +111,7 @@ export async function buildServer() {
           establishmentId: payload.establishmentId,
           roles:           payload.roles,
           iat:             Math.floor(Date.now() / 1000),
-          exp:             Math.floor(Date.now() / 1000) + 3600,
+          exp:             Math.floor(Date.now() / 1000) + POWERSYNC_TOKEN_TTL_SEC,
         },
         POWERSYNC_SECRET,
         { algorithm: 'HS256' },
