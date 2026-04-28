@@ -10,12 +10,31 @@ import '../global.css'
 //   4. Una vez todo listo: ocultar splash y renderizar el árbol de navegación
 //
 // Providers en este layout (de exterior a interior):
-//   PowerSyncProvider  → contexto de SQLite para toda la app
-//   trpc.Provider      → contexto tRPC + React Query
-//   QueryClientProvider → React Query directamente
+//   PowerSyncContext.Provider → contexto de SQLite para toda la app
+//   trpc.Provider             → contexto tRPC + React Query
+//   QueryClientProvider       → React Query directamente
 //
 // Barrera de hidratación:
 //   isPowerSyncReady && isSessionLoaded → ocultar splash → renderizar <Slot />
+//
+// CORRECCIÓN BUG PIN-NAV (Sprint 2):
+//   Añadido useEffect reactivo sobre isAuthenticated para disparar
+//   router.replace() desde el layout raíz — único componente siempre montado.
+//
+//   PROBLEMA RAÍZ: el Guard en (app)/_layout.tsx solo vive cuando Expo Router
+//   está en el segmento (app)/. Cuando el usuario está en (auth)/login, ese
+//   Guard no está montado y no puede reaccionar al cambio de isAuthenticated.
+//   Zustand actualiza el store, pero nadie escucha ese cambio para navegar.
+//
+//   SOLUCIÓN: el Root Layout es el único árbol que SIEMPRE está montado,
+//   independientemente del segmento activo de Expo Router. Observar
+//   isAuthenticated + useSegments() aquí y navegar de forma imperativa es
+//   el patrón correcto para esta arquitectura de grupos de rutas separados.
+//
+//   La condición isSessionLoaded en el useEffect es CRÍTICA: evita
+//   redirecciones prematuras mientras SecureStore está leyendo al arranque.
+//   Sin ella, al abrir la app con sesión guardada habría un flash de
+//   /(auth)/login antes de que loadStoredSession resuelva.
 //
 // Por qué PowerSync PRIMERO:
 //   PowerSyncDatabase.init() abre el archivo SQLite en disco.
@@ -23,29 +42,28 @@ import '../global.css'
 //   init() resuelva, la query falla silenciosamente con "database not open".
 //   La barrera isPowerSyncReady garantiza que nunca ocurra.
 //
-// Por qué NO navegamos aquí:
-//   Este layout no decide a dónde ir. Solo provee contexto.
-//   La navegación es responsabilidad del Guard en app/(app)/_layout.tsx
-//   y del grupo de rutas (auth). Expo Router maneja el routing por segmentos.
+// Por qué NO navegamos solo desde (app)/_layout.tsx:
+//   El Guard en (app)/_layout.tsx solo protege el acceso directo a rutas del
+//   grupo (app)/ (deep linking, restauración de sesión al arrancar). No está
+//   montado cuando el usuario está en (auth)/, así que no puede reaccionar
+//   al login. Ambos mecanismos son necesarios y complementarios.
 //
-// Por qué PowerSyncProvider y NO PowerSyncContext.Provider directamente:
-//   PowerSyncProvider del SDK gestiona internamente el ciclo de vida de la
-//   conexión, el estado de sincronización y los re-renders de los hooks
-//   (useQuery, etc.). Usar PowerSyncContext.Provider directamente se salta
-//   toda esa lógica y deja la app sin gestión de estado de sincronización.
+// Por qué PowerSyncContext.Provider y NO PowerSyncProvider:
+//   PowerSyncProvider no existe en @powersync/react 1.10.0. El contexto se
+//   provee directamente con value={powerSyncDb}.
 // =============================================================================
 
 import { useEffect, useState, useCallback } from 'react'
 import { View }                              from 'react-native'
-import { Slot }                              from 'expo-router'
+import { Slot, useRouter, useSegments }      from 'expo-router'
 import * as SplashScreen                     from 'expo-splash-screen'
 import { QueryClientProvider }               from '@tanstack/react-query'
-import { PowerSyncContext }               from '@powersync/react'
+import { PowerSyncContext }                  from '@powersync/react'
 
 import { trpc, createTrpcQueryClient }       from '../src/lib/trpc'
 import { queryClient }                       from '../src/lib/queryClient'
 import { initPowerSync, powerSyncDb }        from '../src/lib/powersync'
-import { useAuthStore }                      from '../src/store/auth'
+import { useAuthStore, selectIsAuthenticated } from '../src/store/auth'
 
 // Mantener el splash visible hasta que explícitamente lo ocultemos
 SplashScreen.preventAutoHideAsync()
@@ -67,6 +85,10 @@ export default function RootLayout() {
   const [isSessionLoaded,  setIsSessionLoaded]  = useState(false)
 
   const loadStoredSession = useAuthStore(s => s.loadStoredSession)
+  const isAuthenticated   = useAuthStore(selectIsAuthenticated)
+
+  const router   = useRouter()
+  const segments = useSegments()
 
   // ── Inicialización de PowerSync ───────────────────────────────────────────
   // Se ejecuta una sola vez al montar el Root Layout.
@@ -92,6 +114,56 @@ export default function RootLayout() {
       .then(() => setIsSessionLoaded(true))
       .catch(() => setIsSessionLoaded(true)) // Siempre marcar como listo
   }, [loadStoredSession])
+
+  // ── CORRECCIÓN BUG PIN-NAV: Navegación reactiva desde el layout raíz ─────
+  //
+  // Este useEffect es el corazón de la corrección. Observa dos señales:
+  //   1. isAuthenticated — cambia cuando login() actualiza el store de Zustand
+  //   2. isSessionLoaded — garantiza que no navegamos antes de leer SecureStore
+  //
+  // useSegments() devuelve el array de segmentos activos de Expo Router.
+  // Ejemplo: ['(auth)', 'login'] cuando estamos en la pantalla de login.
+  // Ejemplo: ['(app)', 'index'] cuando estamos en el dashboard.
+  // segments[0] es suficiente para determinar en qué grupo de rutas estamos.
+  //
+  // Flujo login exitoso:
+  //   1. handlePinSubmit llama a login() del store
+  //   2. El store setea accessToken + user → isAuthenticated pasa a true
+  //   3. Este useEffect se dispara: inAuthGroup=true, isAuthenticated=true
+  //   4. router.replace('/(app)') navega al dashboard
+  //
+  // Flujo logout / kill switch:
+  //   1. logout() o disconnectAndClear() limpia el store → isAuthenticated=false
+  //   2. Este useEffect se dispara: inAppGroup=true, isAuthenticated=false
+  //   3. router.replace('/(auth)/login') navega al login
+  //
+  // Flujo arranque con sesión guardada:
+  //   1. loadStoredSession() carga tokens → isAuthenticated=true, isSessionLoaded=true
+  //   2. Expo Router arranca en la ruta inicial (generalmente (auth)/login)
+  //   3. Este useEffect se dispara: inAuthGroup=true, isAuthenticated=true
+  //   4. router.replace('/(app)') redirige directamente al dashboard
+  useEffect(() => {
+    // Guardia: no actuar hasta que la sesión haya sido leída de SecureStore.
+    // Sin esta condición, al arrancar la app habría un flash de /(auth)/login
+    // (isAuthenticated=false inicial) antes de que loadStoredSession resuelva.
+    if (!isSessionLoaded) return
+
+    const inAuthGroup = segments[0] === '(auth)'
+    const inAppGroup  = segments[0] === '(app)'
+
+    if (isAuthenticated && inAuthGroup) {
+      // Usuario autenticado intentando acceder a zona de auth → al dashboard
+      router.replace('/(app)')
+      return
+    }
+
+    if (!isAuthenticated && inAppGroup) {
+      // Usuario no autenticado en zona protegida → al login
+      // (cubre logout, kill switch por isActive=false, expiración sin refresh)
+      router.replace('/(auth)/login')
+      return
+    }
+  }, [isAuthenticated, isSessionLoaded, segments, router])
 
   // ── Ocultar splash cuando todo esté listo ────────────────────────────────
   // onLayoutRootView se llama cuando el View raíz termina de layoutear.

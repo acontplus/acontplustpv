@@ -16,10 +16,20 @@
 //   M-03: setTimeout sin cleanup en useEffect del shake — limpiado en return
 //   Selectores: useAuthStore con selector granular para evitar re-renders masivos
 //
-// Sobre la navegación post-login:
-//   Este componente NO navega. Solo llama a login() del store.
-//   El Guard en app/(app)/_layout.tsx detecta isAuthenticated → true
-//   y hace el redirect. Ver comentario en app/(auth)/login.tsx.
+// CORRECCIÓN BUG PIN-NAV (Sprint 2):
+//   handlePinSubmit ahora llama a router.replace('/(app)') tras login exitoso.
+//
+//   Por qué es necesario además del useEffect en app/_layout.tsx:
+//     1. VELOCIDAD: este replace es síncrono post-await, navega en el mismo
+//        tick del event loop en que el login termina. El useEffect en
+//        _layout.tsx puede tener un ciclo de re-render de delay adicional.
+//     2. RESILIENCIA: si Expo Router tuviera algún edge case donde useSegments()
+//        en _layout.tsx no detecta el cambio a tiempo, este replace garantiza
+//        la navegación sin importar el estado de ese efecto.
+//     3. Las tres capas trabajan en conjunto sin contradecirse:
+//        • app/_layout.tsx useEffect  → reacciona al login desde (auth)/
+//        • LoginScreen router.replace → navegación inmediata imperativa
+//        • (app)/_layout.tsx Guard    → protege acceso directo y arranque
 // =============================================================================
 
 import React, {
@@ -41,8 +51,8 @@ import {
   Animated,
 }                              from 'react-native'
 import { StatusBar }           from 'expo-status-bar'
+import { useRouter }           from 'expo-router'
 import AsyncStorage            from '@react-native-async-storage/async-storage'
-import * as SecureStore        from 'expo-secure-store'
 import { useAuthStore }        from '../store/auth'
 import { trpcVanilla }         from '../lib/trpc'
 
@@ -69,57 +79,81 @@ interface PinKeyProps {
   variant?: 'default' | 'delete' | 'empty'
 }
 
-const PinKey = React.memo(({ label, onPress, variant = 'default' }: PinKeyProps) => (
-  <TouchableOpacity
-    onPress={onPress}
-    disabled={variant === 'empty'}
-    className={`
-      flex-1 aspect-square rounded-2xl items-center justify-center mx-1 my-1
-      ${variant === 'empty'   ? 'bg-transparent' : ''}
-      ${variant === 'default' ? 'bg-white active:bg-slate-100' : ''}
-      ${variant === 'delete'  ? 'bg-slate-100 active:bg-slate-200' : ''}
-    `}
-  >
-    {typeof label === 'string'
-      ? <Text className="text-2xl font-semibold text-slate-800">{label}</Text>
-      : label
-    }
-  </TouchableOpacity>
-))
+const PinKey = React.memo(function PinKey({ label, onPress, variant = 'default' }: PinKeyProps) {
+  const scaleAnim = useRef(new Animated.Value(1)).current
 
-// ── Indicadores de punto del PIN ─────────────────────────────────────────────
+  const handlePress = useCallback(() => {
+    Animated.sequence([
+      Animated.timing(scaleAnim, { toValue: 0.9, duration: 80, useNativeDriver: true }),
+      Animated.timing(scaleAnim, { toValue: 1,   duration: 80, useNativeDriver: true }),
+    ]).start()
+    onPress()
+  }, [onPress, scaleAnim])
+
+  if (variant === 'empty') {
+    return <View className="flex-1 m-1.5 h-16" />
+  }
+
+  return (
+    <Animated.View style={{ transform: [{ scale: scaleAnim }], flex: 1 }}>
+      <TouchableOpacity
+        onPress={handlePress}
+        className={`
+          m-1.5 h-16 rounded-2xl items-center justify-center
+          ${variant === 'delete'
+            ? 'bg-slate-200 active:bg-slate-300'
+            : 'bg-white active:bg-slate-100 shadow-sm border border-slate-100'}
+        `}
+        activeOpacity={0.8}
+      >
+        {typeof label === 'string' ? (
+          <Text className={`
+            text-2xl font-semibold
+            ${variant === 'delete' ? 'text-slate-500' : 'text-slate-800'}
+          `}>
+            {label}
+          </Text>
+        ) : (
+          label
+        )}
+      </TouchableOpacity>
+    </Animated.View>
+  )
+})
+
+// ── Indicador de dígitos del PIN ──────────────────────────────────────────────
 interface PinDotsProps {
   length:  number
   filled:  number
-  shaking: boolean
+  shake:   boolean
 }
 
-const PinDots = React.memo(({ length, filled, shaking }: PinDotsProps) => {
+const PinDots = React.memo(function PinDots({ length, filled, shake }: PinDotsProps) {
   const shakeAnim = useRef(new Animated.Value(0)).current
 
   useEffect(() => {
-    if (!shaking) return
-    Animated.sequence([
-      Animated.timing(shakeAnim, { toValue: 10,  duration: 60, useNativeDriver: true }),
-      Animated.timing(shakeAnim, { toValue: -10, duration: 60, useNativeDriver: true }),
-      Animated.timing(shakeAnim, { toValue: 8,   duration: 50, useNativeDriver: true }),
-      Animated.timing(shakeAnim, { toValue: -8,  duration: 50, useNativeDriver: true }),
-      Animated.timing(shakeAnim, { toValue: 0,   duration: 40, useNativeDriver: true }),
-    ]).start()
-  }, [shaking, shakeAnim])
+    if (shake) {
+      Vibration.vibrate(200)
+      Animated.sequence([
+        Animated.timing(shakeAnim, { toValue: 10,  duration: 60, useNativeDriver: true }),
+        Animated.timing(shakeAnim, { toValue: -10, duration: 60, useNativeDriver: true }),
+        Animated.timing(shakeAnim, { toValue: 10,  duration: 60, useNativeDriver: true }),
+        Animated.timing(shakeAnim, { toValue: 0,   duration: 60, useNativeDriver: true }),
+      ]).start()
+    }
+  }, [shake, shakeAnim])
 
   return (
     <Animated.View
-      style={{ transform: [{ translateX: shakeAnim }] }}
       className="flex-row justify-center gap-4 my-8"
+      style={{ transform: [{ translateX: shakeAnim }] }}
     >
       {Array.from({ length }).map((_, i) => (
         <View
           key={i}
-          className={`w-4 h-4 rounded-full
-            ${i < filled
-              ? 'bg-blue-600'
-              : 'bg-slate-200 border-2 border-slate-300 bg-transparent'}
+          className={`
+            w-4 h-4 rounded-full
+            ${i < filled ? 'bg-blue-600' : 'border-2 border-slate-300 bg-transparent'}
           `}
         />
       ))}
@@ -136,22 +170,9 @@ const PinDots = React.memo(({ length, filled, shaking }: PinDotsProps) => {
 const SLUG_STORAGE_KEY = 'acontplus_last_slug'
 const PIN_LENGTH       = 4
 
-// =============================================================================
-// FETCH DE ESTABLECIMIENTOS — usa trpcVanilla (cliente tRPC sin React Query)
-// Se llama antes del login, no hay token todavía.
-// =============================================================================
+// Fetch de establecimientos por tRPC (endpoint publico, sin token)
 async function fetchEstablishments(tenantSlug: string): Promise<Establishment[]> {
-  if (__DEV__) {
-    console.log('[login] fetchEstablishments request', { tenantSlug })
-  }
-
-  const result = await trpcVanilla.auth.listEstablishments.mutate({ tenantSlug })
-
-  if (__DEV__) {
-    console.log('[login] fetchEstablishments response', result)
-  }
-
-  return result as Establishment[]
+  return await trpcVanilla.auth.listEstablishments.mutate({ tenantSlug }) as Establishment[]
 }
 
 // =============================================================================
@@ -159,6 +180,11 @@ async function fetchEstablishments(tenantSlug: string): Promise<Establishment[]>
 // =============================================================================
 
 export default function LoginScreen() {
+  // ── Router para navegación imperativa post-login ──────────────────────────
+  // CORRECCIÓN BUG PIN-NAV: useRouter() permite llamar a router.replace()
+  // inmediatamente después de que login() resuelve exitosamente.
+  const router = useRouter()
+
   // ── Selectores granulares de Zustand (M-02 CORREGIDO) ────────────────────
   // Suscribirse con selector individual en lugar de desestructurar el store
   // completo. Así el componente solo re-renderiza cuando cambia el campo
@@ -210,19 +236,29 @@ export default function LoginScreen() {
   }, [error, step])
 
   // ── PASO 3: submit del PIN ─────────────────────────────────────────────────
-  // Definido antes de handlePinKey para poder ser referenciado en él.
+  // CORRECCIÓN BUG PIN-NAV: router.replace('/(app)') tras login exitoso.
+  //
+  // El store de Zustand ya tiene isAuthenticated=true en este punto porque
+  // login() lo actualiza antes de resolver la promesa. El replace navega
+  // de forma imperativa sin esperar al ciclo de re-render del useEffect
+  // en app/_layout.tsx, eliminando cualquier posible delay de reactividad.
+  //
+  // Si login() lanza un error, el catch lo ignora aquí porque el store
+  // ya capturó el mensaje en state.error. El useEffect de shake lo detecta
+  // y anima los dots del PIN automáticamente.
   const handlePinSubmit = useCallback(async (submittedPin: string) => {
     if (!selectedEstId) return
 
     try {
       await login(tenantSlug.trim().toLowerCase(), submittedPin, selectedEstId)
-      // Login exitoso → NO navegamos aquí.
-      // El Guard en app/(app)/_layout.tsx detecta isAuthenticated → true
-      // y hace el redirect a /(app) automáticamente.
+      // CORRECCIÓN BUG PIN-NAV: navegar de forma imperativa al dashboard.
+      // router.replace() en lugar de push(): evita que el usuario pueda
+      // volver a la pantalla de login con el botón físico de Android.
+      router.replace('/(app)')
     } catch {
       // El error ya está en el store → el useEffect del shake lo detecta
     }
-  }, [tenantSlug, selectedEstId, login])
+  }, [tenantSlug, selectedEstId, login, router])
 
   // ── PASO 3: ingreso de dígitos (M-02 CORREGIDO) ──────────────────────────
   // Usar setPin con updater funcional (prev => ...) elimina la dependencia
@@ -343,18 +379,15 @@ export default function LoginScreen() {
               `}>
                 <TextInput
                   ref={slugInputRef}
-                  value={tenantSlug}
-                  onChangeText={text => {
-                    setTenantSlug(text)
-                    setSlugError(null)
-                  }}
-                  onSubmitEditing={handleSlugSubmit}
-                  placeholder="ej: mi-restaurante"
+                  className="flex-1 text-base text-slate-800"
+                  placeholder="mi-restaurante"
                   placeholderTextColor="#94a3b8"
+                  value={tenantSlug}
+                  onChangeText={text => { setTenantSlug(text); setSlugError(null) }}
+                  onSubmitEditing={handleSlugSubmit}
                   autoCapitalize="none"
                   autoCorrect={false}
                   returnKeyType="go"
-                  className="flex-1 text-slate-800 text-base"
                 />
               </View>
 
@@ -366,11 +399,10 @@ export default function LoginScreen() {
                 onPress={handleSlugSubmit}
                 disabled={slugLoading || !tenantSlug.trim()}
                 className={`
-                  mt-6 rounded-xl py-4 items-center
+                  mt-6 py-4 rounded-xl items-center
                   ${tenantSlug.trim() && !slugLoading
                     ? 'bg-blue-600 active:bg-blue-700'
-                    : 'bg-slate-200'
-                  }
+                    : 'bg-slate-200'}
                 `}
               >
                 {slugLoading
@@ -422,48 +454,58 @@ export default function LoginScreen() {
                 </Text>
               </View>
 
-              <PinDots
-                length={PIN_LENGTH}
-                filled={pin.length}
-                shaking={pinShake}
-              />
+              {/* Puntos indicadores del PIN */}
+              <PinDots length={PIN_LENGTH} filled={pin.length} shake={pinShake} />
 
+              {/* Mensaje de error */}
               {error && (
-                <Text className="text-red-500 text-sm text-center mb-4">{error}</Text>
+                <Text className="text-red-500 text-sm text-center mb-4 -mt-2">
+                  {error}
+                </Text>
               )}
 
-              {/* Pad numérico */}
-              <View className="mt-auto">
-                {[
-                  ['1', '2', '3'],
-                  ['4', '5', '6'],
-                  ['7', '8', '9'],
-                ].map((row, ri) => (
-                  <View key={ri} className="flex-row justify-between mb-2">
-                    {row.map(digit => (
-                      <PinKey
-                        key={digit}
-                        label={digit}
-                        onPress={() => handlePinKey(digit)}
-                      />
-                    ))}
-                  </View>
-                ))}
+              {/* Loading overlay */}
+              {isLoading && (
+                <View className="items-center mb-4">
+                  <ActivityIndicator size="small" color="#2563eb" />
+                  <Text className="text-slate-500 text-sm mt-2">Verificando...</Text>
+                </View>
+              )}
 
-                {/* Última fila: vacío, 0, borrar */}
-                <View className="flex-row justify-between">
-                  <PinKey label="" onPress={() => {}} variant="empty" />
+              {/* Teclado numérico */}
+              <View className="mt-2">
+                {/* Fila 1-2-3 */}
+                <View className="flex-row">
+                  {(['1','2','3'] as const).map(d => (
+                    <PinKey key={d} label={d} onPress={() => handlePinKey(d)} />
+                  ))}
+                </View>
+                {/* Fila 4-5-6 */}
+                <View className="flex-row">
+                  {(['4','5','6'] as const).map(d => (
+                    <PinKey key={d} label={d} onPress={() => handlePinKey(d)} />
+                  ))}
+                </View>
+                {/* Fila 7-8-9 */}
+                <View className="flex-row">
+                  {(['7','8','9'] as const).map(d => (
+                    <PinKey key={d} label={d} onPress={() => handlePinKey(d)} />
+                  ))}
+                </View>
+                {/* Fila volver-0-borrar */}
+                <View className="flex-row">
+                  <PinKey
+                    label={<Text className="text-blue-600 text-sm font-medium">Volver</Text>}
+                    onPress={handleBack}
+                    variant="delete"
+                  />
                   <PinKey label="0" onPress={() => handlePinKey('0')} />
                   <PinKey
-                    label={<Text className="text-2xl text-slate-600">⌫</Text>}
+                    label="⌫"
                     onPress={handlePinDelete}
                     variant="delete"
                   />
                 </View>
-
-                <TouchableOpacity onPress={handleBack} className="mt-4 items-center py-3">
-                  <Text className="text-blue-600 font-medium">← Cambiar establecimiento</Text>
-                </TouchableOpacity>
               </View>
             </View>
           )}
