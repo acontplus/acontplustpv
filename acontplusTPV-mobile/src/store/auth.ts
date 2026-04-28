@@ -28,6 +28,7 @@
 import { create }           from 'zustand'
 import { immer }            from 'zustand/middleware/immer'
 import * as SecureStore     from 'expo-secure-store'
+import Constants            from 'expo-constants'
 
 // ── Tipos ─────────────────────────────────────────────────────────────────────
 
@@ -76,7 +77,8 @@ const KEYS = {
   USER:          'acontplus_user',
 } as const
 
-const API_URL = 'https://api.resuelveyaa.com'
+const API_URL = Constants.expoConfig?.extra?.apiUrl || 'http://localhost:3000'
+const POWERSYNC_URL = Constants.expoConfig?.extra?.powerSyncUrl || 'http://localhost:8080'
 
 async function disconnectPowerSyncSafely(): Promise<void> {
   const { disconnectAndClear } = require('../lib/powersync') as typeof import('../lib/powersync')
@@ -124,28 +126,9 @@ export const useAuthStore = create<AuthState & AuthActions>()(
           pin,
           establishmentId,
         }) as LoginResponse
-		
-		console.log('[auth] login mutate OK', { userId: loginResult.user?.id })
-		
-// Añadir estos:
-console.log('[auth] paso 2: powersync token...')
-
-// ... código del powersync token ...
-
-console.log('[auth] paso 3: guardando en SecureStore...')
-
-// ... código de SecureStore ...
-
-console.log('[auth] paso 4: actualizando estado...')
-
-// ... código del set() ...
-
-console.log('[auth] login completado exitosamente')
-		
-		
 
         // Paso 2: obtener token de PowerSync (no bloquea el login si falla)
-        let powerSyncUrl = 'https://powersync.resuelveyaa.com'
+        const powerSyncUrl = Constants.expoConfig?.extra?.powerSyncUrl || POWERSYNC_URL
         try {
           const psResponse = await fetch(`${API_URL}/auth/powersync-token`, {
             method:  'POST',
@@ -277,7 +260,7 @@ console.log('[auth] login completado exitosamente')
           state.accessToken  = accessToken
           state.refreshToken = refreshToken
           state.user         = user
-          state.powerSyncUrl = 'https://powersync.resuelveyaa.com'
+          state.powerSyncUrl = Constants.expoConfig?.extra?.powerSyncUrl || POWERSYNC_URL
         })
       } catch {
         // SecureStore vacío o datos corruptos — arrancar sin sesión
