@@ -164,12 +164,26 @@ const PIN_LENGTH       = 4
 async function fetchEstablishments(tenantSlug: string): Promise<Establishment[]> {
   //const apiUrl = Constants.expoConfig?.extra?.apiUrl ?? ''
   const apiUrl = 'https://api.resuelveyaa.com'
+  const url = `${apiUrl}/trpc/auth.listEstablishments`
+  if (__DEV__) {
+    console.log('[login] fetchEstablishments request', { url, tenantSlug })
+  }
 
-  const res = await fetch(`${apiUrl}/trpc/auth.listEstablishments`, {
+  const res = await fetch(url, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ json: { tenantSlug } }),
   })
+
+  if (__DEV__) {
+    const bodyText = await res.clone().text()
+    console.log('[login] fetchEstablishments response', {
+      url,
+      ok:     res.ok,
+      status: res.status,
+      body:   bodyText.slice(0, 500),
+    })
+  }
 
   if (!res.ok) {
     throw new Error('Tenant no encontrado. Verifica el nombre del negocio.')

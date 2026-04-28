@@ -3,8 +3,9 @@
 // Router de autenticación
 //
 // Procedimientos públicos (sin autenticación):
-//   - login              → PIN + tenantSlug → accessToken + refreshToken
-//   - refresh            → refreshToken → nuevo accessToken
+//   - login                → PIN + tenantSlug → accessToken + refreshToken
+//   - refresh              → refreshToken → nuevo accessToken
+//   - listEstablishments   → tenantSlug → lista de establecimientos activos
 //
 // Procedimientos protegidos:
 //   - logout             → invalida el refreshToken del usuario actual
@@ -31,6 +32,46 @@ import { LoginResponse, RefreshResponse, GenerateDeviceTokenResponse } from '../
 import { DeviceRole } from '@prisma/client'
 
 export const authRouter = router({
+
+  // ---------------------------------------------------------------------------
+  // listEstablishments
+  // Endpoint público — retorna establecimientos activos de un tenant por slug.
+  // Se llama ANTES del login para que el usuario seleccione su establecimiento.
+  // No requiere autenticación — el slug del tenant es información pública
+  // compartida por todos los empleados del negocio.
+  // ---------------------------------------------------------------------------
+  listEstablishments: procedure
+    .input(z.object({ tenantSlug: z.string().min(1) }))
+    .query(async ({ input }) => {
+      const tenant = await prisma.tenant.findUnique({
+        where: { slug: input.tenantSlug },
+      })
+
+      if (!tenant || !tenant.isActive) {
+        throw new TRPCError({
+          code:    'NOT_FOUND',
+          message: 'Tenant no encontrado',
+        })
+      }
+
+      const establishments = await withTenant(tenant.id, (tx) =>
+        tx.establishment.findMany({
+          where: {
+            tenantId:  tenant.id,
+            isActive:  true,
+            deletedAt: null,
+          },
+          select: {
+            id:   true,
+            name: true,
+            code: true,
+          },
+          orderBy: { code: 'asc' },
+        }),
+      )
+
+      return establishments
+    }),
 
   // ---------------------------------------------------------------------------
   // login
@@ -222,7 +263,6 @@ export const authRouter = router({
 
       // 5. Obtener el establecimiento activo del usuario
       //    Reutilizamos el primer establecimiento activo del tenant como fallback
-      //    En una versión futura, el usuario puede tener un establecimiento preferido
       const establishment = await withTenant(payload.tenantId, (tx) =>
         tx.establishment.findFirst({
           where: {
