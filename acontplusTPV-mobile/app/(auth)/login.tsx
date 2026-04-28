@@ -13,12 +13,11 @@
 // en tests unitarios sin depender del contexto de Expo Router.
 //
 // IMPORTANTE — sobre la navegación post-login:
-//   LoginScreen NO llama a router.replace() cuando el login es exitoso.
-//   Solo actualiza el store de Zustand (isAuthenticated → true).
-//   El Guard en app/(app)/_layout.tsx detecta el cambio y hace el redirect.
-//   Este patrón evita el problema de sesión restaurada desde SecureStore:
-//   en ese flujo el usuario nunca pasa por esta pantalla, pero el Guard
-//   siempre se ejecuta.
+//   LoginScreen llama a router.replace('/(app)') tras login exitoso para
+//   navegación inmediata. Además, el Root Layout en app/_layout.tsx observa
+//   isAuthenticated y redirige de forma reactiva como respaldo.
+//   Esta combinación cubre tanto el login interactivo como la restauración
+//   de sesión desde SecureStore al arrancar la app.
 // =============================================================================
 
 import LoginScreen from '../../src/screens/LoginScreen'
