@@ -161,6 +161,10 @@ export default function AppLayout() {
   const isAuthenticated = useAuthStore(selectIsAuthenticated)
   const businessDayId   = useAuthStore(selectBusinessDayId)
   const roles           = useAuthStore(selectRoles)
+  const accessToken     = useAuthStore(s => s.accessToken)
+  const user            = useAuthStore(s => s.user)
+
+  console.log('[guard] isAuthenticated:', isAuthenticated, 'token:', !!accessToken, 'user:', !!user)
 
   if (!isAuthenticated) {
     return <Redirect href="/(auth)/login" />

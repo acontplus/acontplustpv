@@ -43,8 +43,8 @@ import {
 import { StatusBar }           from 'expo-status-bar'
 import AsyncStorage            from '@react-native-async-storage/async-storage'
 import * as SecureStore        from 'expo-secure-store'
-import Constants               from 'expo-constants'
 import { useAuthStore }        from '../store/auth'
+import { trpcVanilla }         from '../lib/trpc'
 
 // =============================================================================
 // TIPOS
@@ -69,81 +69,57 @@ interface PinKeyProps {
   variant?: 'default' | 'delete' | 'empty'
 }
 
-const PinKey = React.memo(function PinKey({ label, onPress, variant = 'default' }: PinKeyProps) {
-  const scaleAnim = useRef(new Animated.Value(1)).current
+const PinKey = React.memo(({ label, onPress, variant = 'default' }: PinKeyProps) => (
+  <TouchableOpacity
+    onPress={onPress}
+    disabled={variant === 'empty'}
+    className={`
+      flex-1 aspect-square rounded-2xl items-center justify-center mx-1 my-1
+      ${variant === 'empty'   ? 'bg-transparent' : ''}
+      ${variant === 'default' ? 'bg-white active:bg-slate-100' : ''}
+      ${variant === 'delete'  ? 'bg-slate-100 active:bg-slate-200' : ''}
+    `}
+  >
+    {typeof label === 'string'
+      ? <Text className="text-2xl font-semibold text-slate-800">{label}</Text>
+      : label
+    }
+  </TouchableOpacity>
+))
 
-  const handlePress = useCallback(() => {
-    Animated.sequence([
-      Animated.timing(scaleAnim, { toValue: 0.9, duration: 80, useNativeDriver: true }),
-      Animated.timing(scaleAnim, { toValue: 1,   duration: 80, useNativeDriver: true }),
-    ]).start()
-    onPress()
-  }, [onPress, scaleAnim])
-
-  if (variant === 'empty') {
-    return <View className="flex-1 m-1.5 h-16" />
-  }
-
-  return (
-    <Animated.View style={{ transform: [{ scale: scaleAnim }], flex: 1 }}>
-      <TouchableOpacity
-        onPress={handlePress}
-        className={`
-          m-1.5 h-16 rounded-2xl items-center justify-center
-          ${variant === 'delete'
-            ? 'bg-slate-200 active:bg-slate-300'
-            : 'bg-white active:bg-slate-100 shadow-sm border border-slate-100'}
-        `}
-        activeOpacity={0.8}
-      >
-        {typeof label === 'string' ? (
-          <Text className={`
-            text-2xl font-semibold
-            ${variant === 'delete' ? 'text-slate-500' : 'text-slate-800'}
-          `}>
-            {label}
-          </Text>
-        ) : (
-          label
-        )}
-      </TouchableOpacity>
-    </Animated.View>
-  )
-})
-
-// ── Indicador de dígitos del PIN ──────────────────────────────────────────────
+// ── Indicadores de punto del PIN ─────────────────────────────────────────────
 interface PinDotsProps {
   length:  number
   filled:  number
-  shake:   boolean
+  shaking: boolean
 }
 
-const PinDots = React.memo(function PinDots({ length, filled, shake }: PinDotsProps) {
+const PinDots = React.memo(({ length, filled, shaking }: PinDotsProps) => {
   const shakeAnim = useRef(new Animated.Value(0)).current
 
   useEffect(() => {
-    if (shake) {
-      Vibration.vibrate(200)
-      Animated.sequence([
-        Animated.timing(shakeAnim, { toValue: 10,  duration: 60, useNativeDriver: true }),
-        Animated.timing(shakeAnim, { toValue: -10, duration: 60, useNativeDriver: true }),
-        Animated.timing(shakeAnim, { toValue: 10,  duration: 60, useNativeDriver: true }),
-        Animated.timing(shakeAnim, { toValue: 0,   duration: 60, useNativeDriver: true }),
-      ]).start()
-    }
-  }, [shake, shakeAnim])
+    if (!shaking) return
+    Animated.sequence([
+      Animated.timing(shakeAnim, { toValue: 10,  duration: 60, useNativeDriver: true }),
+      Animated.timing(shakeAnim, { toValue: -10, duration: 60, useNativeDriver: true }),
+      Animated.timing(shakeAnim, { toValue: 8,   duration: 50, useNativeDriver: true }),
+      Animated.timing(shakeAnim, { toValue: -8,  duration: 50, useNativeDriver: true }),
+      Animated.timing(shakeAnim, { toValue: 0,   duration: 40, useNativeDriver: true }),
+    ]).start()
+  }, [shaking, shakeAnim])
 
   return (
     <Animated.View
-      className="flex-row justify-center gap-4 my-8"
       style={{ transform: [{ translateX: shakeAnim }] }}
+      className="flex-row justify-center gap-4 my-8"
     >
       {Array.from({ length }).map((_, i) => (
         <View
           key={i}
-          className={`
-            w-4 h-4 rounded-full
-            ${i < filled ? 'bg-blue-600' : 'border-2 border-slate-300 bg-transparent'}
+          className={`w-4 h-4 rounded-full
+            ${i < filled
+              ? 'bg-blue-600'
+              : 'bg-slate-200 border-2 border-slate-300 bg-transparent'}
           `}
         />
       ))}
@@ -160,45 +136,22 @@ const PinDots = React.memo(function PinDots({ length, filled, shake }: PinDotsPr
 const SLUG_STORAGE_KEY = 'acontplus_last_slug'
 const PIN_LENGTH       = 4
 
-// Fetch de establecimientos sin tRPC (se llama antes del login, no hay token)
+// =============================================================================
+// FETCH DE ESTABLECIMIENTOS — usa trpcVanilla (cliente tRPC sin React Query)
+// Se llama antes del login, no hay token todavía.
+// =============================================================================
 async function fetchEstablishments(tenantSlug: string): Promise<Establishment[]> {
-  //const apiUrl = Constants.expoConfig?.extra?.apiUrl ?? ''
-  const apiUrl = 'https://api.resuelveyaa.com'
-  const url = `${apiUrl}/trpc/auth.listEstablishments`
   if (__DEV__) {
-    console.log('[login] fetchEstablishments request', { url, tenantSlug })
+    console.log('[login] fetchEstablishments request', { tenantSlug })
   }
 
-  const res = await fetch(url, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ json: { tenantSlug } }),
-  })
+  const result = await trpcVanilla.auth.listEstablishments.mutate({ tenantSlug })
 
   if (__DEV__) {
-    const bodyText = await res.clone().text()
-    console.log('[login] fetchEstablishments response', {
-      url,
-      ok:     res.ok,
-      status: res.status,
-      body:   bodyText.slice(0, 500),
-    })
+    console.log('[login] fetchEstablishments response', result)
   }
 
-  if (!res.ok) {
-    throw new Error('Tenant no encontrado. Verifica el nombre del negocio.')
-  }
-
-  const data = await res.json() as {
-    result?: { data?: { json: Establishment[] } }
-    error?:  { message: string }
-  }
-
-  if (data.error) {
-    throw new Error(data.error.message)
-  }
-
-  return data.result?.data?.json ?? []
+  return result as Establishment[]
 }
 
 // =============================================================================
@@ -392,16 +345,16 @@ export default function LoginScreen() {
                   ref={slugInputRef}
                   value={tenantSlug}
                   onChangeText={text => {
-                    setTenantSlug(text.toLowerCase().replace(/[^a-z0-9-]/g, ''))
+                    setTenantSlug(text)
                     setSlugError(null)
                   }}
                   onSubmitEditing={handleSlugSubmit}
-                  placeholder="mi-restaurante"
+                  placeholder="ej: mi-restaurante"
                   placeholderTextColor="#94a3b8"
                   autoCapitalize="none"
                   autoCorrect={false}
                   returnKeyType="go"
-                  className="flex-1 text-base text-slate-800"
+                  className="flex-1 text-slate-800 text-base"
                 />
               </View>
 
@@ -413,10 +366,11 @@ export default function LoginScreen() {
                 onPress={handleSlugSubmit}
                 disabled={slugLoading || !tenantSlug.trim()}
                 className={`
-                  mt-6 py-4 rounded-xl items-center
-                  ${slugLoading || !tenantSlug.trim()
-                    ? 'bg-slate-200'
-                    : 'bg-blue-600 active:bg-blue-700'}
+                  mt-6 rounded-xl py-4 items-center
+                  ${tenantSlug.trim() && !slugLoading
+                    ? 'bg-blue-600 active:bg-blue-700'
+                    : 'bg-slate-200'
+                  }
                 `}
               >
                 {slugLoading
@@ -468,58 +422,48 @@ export default function LoginScreen() {
                 </Text>
               </View>
 
-              {/* Puntos indicadores del PIN */}
-              <PinDots length={PIN_LENGTH} filled={pin.length} shake={pinShake} />
+              <PinDots
+                length={PIN_LENGTH}
+                filled={pin.length}
+                shaking={pinShake}
+              />
 
-              {/* Mensaje de error */}
               {error && (
-                <Text className="text-red-500 text-sm text-center mb-4 -mt-2">
-                  {error}
-                </Text>
+                <Text className="text-red-500 text-sm text-center mb-4">{error}</Text>
               )}
 
-              {/* Loading overlay */}
-              {isLoading && (
-                <View className="items-center mb-4">
-                  <ActivityIndicator size="small" color="#2563eb" />
-                  <Text className="text-slate-500 text-sm mt-2">Verificando...</Text>
-                </View>
-              )}
+              {/* Pad numérico */}
+              <View className="mt-auto">
+                {[
+                  ['1', '2', '3'],
+                  ['4', '5', '6'],
+                  ['7', '8', '9'],
+                ].map((row, ri) => (
+                  <View key={ri} className="flex-row justify-between mb-2">
+                    {row.map(digit => (
+                      <PinKey
+                        key={digit}
+                        label={digit}
+                        onPress={() => handlePinKey(digit)}
+                      />
+                    ))}
+                  </View>
+                ))}
 
-              {/* Teclado numérico */}
-              <View className="mt-2">
-                {/* Fila 1-2-3 */}
-                <View className="flex-row">
-                  {(['1','2','3'] as const).map(d => (
-                    <PinKey key={d} label={d} onPress={() => handlePinKey(d)} />
-                  ))}
-                </View>
-                {/* Fila 4-5-6 */}
-                <View className="flex-row">
-                  {(['4','5','6'] as const).map(d => (
-                    <PinKey key={d} label={d} onPress={() => handlePinKey(d)} />
-                  ))}
-                </View>
-                {/* Fila 7-8-9 */}
-                <View className="flex-row">
-                  {(['7','8','9'] as const).map(d => (
-                    <PinKey key={d} label={d} onPress={() => handlePinKey(d)} />
-                  ))}
-                </View>
-                {/* Fila volver-0-borrar */}
-                <View className="flex-row">
-                  <PinKey
-                    label={<Text className="text-blue-600 text-sm font-medium">Volver</Text>}
-                    onPress={handleBack}
-                    variant="delete"
-                  />
+                {/* Última fila: vacío, 0, borrar */}
+                <View className="flex-row justify-between">
+                  <PinKey label="" onPress={() => {}} variant="empty" />
                   <PinKey label="0" onPress={() => handlePinKey('0')} />
                   <PinKey
-                    label="⌫"
+                    label={<Text className="text-2xl text-slate-600">⌫</Text>}
                     onPress={handlePinDelete}
                     variant="delete"
                   />
                 </View>
+
+                <TouchableOpacity onPress={handleBack} className="mt-4 items-center py-3">
+                  <Text className="text-blue-600 font-medium">← Cambiar establecimiento</Text>
+                </TouchableOpacity>
               </View>
             </View>
           )}

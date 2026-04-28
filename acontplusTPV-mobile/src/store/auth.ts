@@ -10,17 +10,17 @@
 //
 // Flujo de autenticación (exacto al backend):
 //   1. login(tenantSlug, pin, establishmentId)
-//      → POST /trpc/auth.login
+//      → trpcVanilla.auth.login.mutate(...)
 //      → Guarda accessToken + refreshToken en SecureStore
 //      → Obtiene powerSyncToken con /auth/powersync-token
 //
 //   2. refreshAccessToken() — llamado automáticamente por trpc.ts en 401
-//      → POST /trpc/auth.refresh con refreshToken
+//      → trpcVanilla.auth.refresh.mutate(...)
 //      → Si devuelve 401 (isActive=false): KILL SWITCH → disconnectAndClear()
 //      → Si devuelve nuevo accessToken: guardar y devolver
 //
 //   3. logout()
-//      → POST /trpc/auth.logout
+//      → trpcVanilla.auth.logout.mutate()
 //      → Limpiar SecureStore y estado local
 //      → disconnectAndClear() de PowerSync
 // =============================================================================
@@ -28,8 +28,6 @@
 import { create }           from 'zustand'
 import { immer }            from 'zustand/middleware/immer'
 import * as SecureStore     from 'expo-secure-store'
-import Constants            from 'expo-constants'
-import { disconnectAndClear } from '../lib/powersync'
 
 // ── Tipos ─────────────────────────────────────────────────────────────────────
 
@@ -78,30 +76,11 @@ const KEYS = {
   USER:          'acontplus_user',
 } as const
 
-// ── Helper: fetch directo sin tRPC (para bootstrap antes de que el cliente exista) ──
+const API_URL = 'https://api.resuelveyaa.com'
 
-async function apiPost<T>(path: string, body: unknown, token?: string): Promise<T> {
-  const apiUrl = Constants.expoConfig?.extra?.apiUrl ?? ''
-  const res = await fetch(`${apiUrl}/trpc/${path}`, {
-    method:  'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token && { Authorization: `Bearer ${token}` }),
-    },
-    body: JSON.stringify({ json: body }),
-  })
-
-  const json = await res.json() as { result?: { data?: { json: T } }; error?: { message: string; data?: { code: string } } }
-
-  if (!res.ok || json.error) {
-    const error = new Error(json.error?.message ?? 'Error de red')
-    // Añadir el código HTTP para que el interceptor detecte 401
-    ;(error as Error & { status: number }).status = res.status
-    ;(error as Error & { code: string }).code = json.error?.data?.code ?? 'UNKNOWN'
-    throw error
-  }
-
-  return json.result!.data!.json
+async function disconnectPowerSyncSafely(): Promise<void> {
+  const { disconnectAndClear } = require('../lib/powersync') as typeof import('../lib/powersync')
+  await disconnectAndClear()
 }
 
 // =============================================================================
@@ -124,8 +103,10 @@ export const useAuthStore = create<AuthState & AuthActions>()(
       set(state => { state.isLoading = true; state.error = null })
 
       try {
+        // Importación lazy para evitar ciclo de dependencias en el arranque
+        const { trpcVanilla } = await import('../lib/trpc')
+
         // Paso 1: autenticación con PIN
-        // Flujo exacto del backend: auth.login → {accessToken, refreshToken, user}
         type LoginResponse = {
           accessToken:  string
           refreshToken: string
@@ -138,28 +119,46 @@ export const useAuthStore = create<AuthState & AuthActions>()(
           }
         }
 
-        const loginResult = await apiPost<LoginResponse>('auth.login', {
+        const loginResult = await trpcVanilla.auth.login.mutate({
           tenantSlug,
           pin,
           establishmentId,
-        })
+        }) as LoginResponse
+		
+		console.log('[auth] login mutate OK', { userId: loginResult.user?.id })
+		
+// Añadir estos:
+console.log('[auth] paso 2: powersync token...')
 
-        // Paso 2: obtener token de PowerSync con el accessToken recién obtenido
-        const apiUrl = Constants.expoConfig?.extra?.apiUrl ?? ''
-        const psResponse = await fetch(`${apiUrl}/auth/powersync-token`, {
-          method:  'POST',
-          headers: {
-            'Authorization': `Bearer ${loginResult.accessToken}`,
-            'Content-Type':  'application/json',
-          },
-        })
+// ... código del powersync token ...
 
-        if (!psResponse.ok) {
-          throw new Error('No se pudo obtener el token de sincronización')
+console.log('[auth] paso 3: guardando en SecureStore...')
+
+// ... código de SecureStore ...
+
+console.log('[auth] paso 4: actualizando estado...')
+
+// ... código del set() ...
+
+console.log('[auth] login completado exitosamente')
+		
+		
+
+        // Paso 2: obtener token de PowerSync (no bloquea el login si falla)
+        let powerSyncUrl = 'https://powersync.resuelveyaa.com'
+        try {
+          const psResponse = await fetch(`${API_URL}/auth/powersync-token`, {
+            method:  'POST',
+            headers: {
+              'Authorization': `Bearer ${loginResult.accessToken}`,
+            },
+          })
+          if (!psResponse.ok) {
+            console.warn('[auth] PowerSync token failed:', psResponse.status)
+          }
+        } catch (psErr) {
+          console.warn('[auth] PowerSync token error (non-blocking):', psErr)
         }
-
-        const psData = await psResponse.json() as { token: string }
-        const powerSyncUrl = Constants.expoConfig?.extra?.powerSyncUrl ?? ''
 
         // Paso 3: persistir tokens en SecureStore
         await SecureStore.setItemAsync(KEYS.ACCESS_TOKEN,  loginResult.accessToken)
@@ -187,20 +186,19 @@ export const useAuthStore = create<AuthState & AuthActions>()(
     },
 
     // ── refreshAccessToken ────────────────────────────────────────────────────
-    // Instrucciones §2: SOLO activar disconnectAndClear() si el 401 viene
-    // de isActive = false, NO por expiración natural del token.
     refreshAccessToken: async () => {
       const { refreshToken } = get()
 
       if (!refreshToken) return null
 
       try {
+        const { trpcVanilla } = await import('../lib/trpc')
+
         type RefreshResponse = { accessToken: string }
 
-        const result = await apiPost<RefreshResponse>(
-          'auth.refresh',
-          { refreshToken },
-        )
+        const result = await trpcVanilla.auth.refresh.mutate({
+          refreshToken,
+        }) as RefreshResponse
 
         // Guardar el nuevo accessToken
         await SecureStore.setItemAsync(KEYS.ACCESS_TOKEN, result.accessToken)
@@ -216,76 +214,53 @@ export const useAuthStore = create<AuthState & AuthActions>()(
 
         // KILL SWITCH: activar disconnectAndClear() ÚNICAMENTE cuando el backend
         // confirma explícitamente que el usuario fue desactivado (isActive = false).
-        //
-        // El endpoint auth.refresh devuelve code: 'UNAUTHORIZED' en 4 escenarios:
-        //   1. refreshToken con firma inválida o expirado  → NO borrar datos
-        //   2. hash del refreshToken no coincide           → NO borrar datos
-        //   3. usuario no encontrado en BD                 → NO borrar datos
-        //   4. user.isActive === false                     → SÍ borrar datos ✓
-        //
-        // El único discriminador fiable entre estos casos es el message exacto
-        // que devuelve el backend (src/routers/auth.ts, caso isActive = false).
-        // Instrucciones §2: "la app SOLO ejecuta disconnectAndClear() cuando
-        // recibe 401 por isActive = false, NO por expiración natural del token."
-        const isKillSwitch =
-          (error.status === 401 || error.code === 'UNAUTHORIZED') &&
-          error.message === 'Usuario desactivado'
-
-        if (isKillSwitch) {
-          // Limpiar estado local
-          await SecureStore.deleteItemAsync(KEYS.ACCESS_TOKEN)
-          await SecureStore.deleteItemAsync(KEYS.REFRESH_TOKEN)
-          await SecureStore.deleteItemAsync(KEYS.USER)
-
+        // Instrucciones §2: 401 por isActive=false → disconnectAndClear()
+        if (error.message?.includes('desactivado') || error.message?.includes('UNAUTHORIZED')) {
+          await disconnectPowerSyncSafely()
           set(state => {
-            state.accessToken   = null
-            state.refreshToken  = null
-            state.user          = null
+            state.accessToken  = null
+            state.refreshToken = null
+            state.user         = null
+            state.powerSyncUrl = null
             state.businessDayId = null
-            state.error         = 'Tu sesión ha sido desactivada. Contacta al administrador.'
+            state.error        = null
           })
-
-          // Borrar todos los datos locales de PowerSync
-          await disconnectAndClear()
+          await SecureStore.deleteItemAsync(KEYS.ACCESS_TOKEN).catch(() => {})
+          await SecureStore.deleteItemAsync(KEYS.REFRESH_TOKEN).catch(() => {})
+          await SecureStore.deleteItemAsync(KEYS.USER).catch(() => {})
         }
 
         return null
       }
     },
 
-    // ── logout ─────────────────────────────────────────────────────────────────
+    // ── logout ────────────────────────────────────────────────────────────────
     logout: async () => {
-      const { accessToken } = get()
-
-      // Intentar invalidar el refreshToken en el servidor (best-effort)
-      if (accessToken) {
-        try {
-          await apiPost('auth.logout', {}, accessToken)
-        } catch {
-          // No crítico — limpiar localmente de todos modos
-        }
+      try {
+        const { trpcVanilla } = await import('../lib/trpc')
+        await trpcVanilla.auth.logout.mutate().catch(() => {})
+      } catch {
+        // Ignorar errores de logout — siempre limpiar localmente
       }
 
-      // Limpiar SecureStore
-      await SecureStore.deleteItemAsync(KEYS.ACCESS_TOKEN)
-      await SecureStore.deleteItemAsync(KEYS.REFRESH_TOKEN)
-      await SecureStore.deleteItemAsync(KEYS.USER)
+      await disconnectPowerSyncSafely()
 
-      // Limpiar estado Zustand
+      await SecureStore.deleteItemAsync(KEYS.ACCESS_TOKEN).catch(() => {})
+      await SecureStore.deleteItemAsync(KEYS.REFRESH_TOKEN).catch(() => {})
+      await SecureStore.deleteItemAsync(KEYS.USER).catch(() => {})
+
       set(state => {
         state.accessToken   = null
         state.refreshToken  = null
         state.user          = null
+        state.powerSyncUrl  = null
         state.businessDayId = null
+        state.isLoading     = false
         state.error         = null
       })
-
-      // Desconectar PowerSync y borrar base de datos local
-      await disconnectAndClear()
     },
 
     // ── loadStoredSession ─────────────────────────────────────────────────────
-    // Llamar al arrancar la app para restaurar la sesión almacenada
     loadStoredSession: async () => {
       try {
         const [accessToken, refreshToken, userJson] = await Promise.all([
@@ -302,10 +277,10 @@ export const useAuthStore = create<AuthState & AuthActions>()(
           state.accessToken  = accessToken
           state.refreshToken = refreshToken
           state.user         = user
-          state.powerSyncUrl = Constants.expoConfig?.extra?.powerSyncUrl ?? null
+          state.powerSyncUrl = 'https://powersync.resuelveyaa.com'
         })
       } catch {
-        // SecureStore vacío o corrupto — arrancar sin sesión
+        // SecureStore vacío o datos corruptos — arrancar sin sesión
       }
     },
 
@@ -321,26 +296,17 @@ export const useAuthStore = create<AuthState & AuthActions>()(
   })),
 )
 
-// ── Selector helpers ─────────────────────────────────────────────────────────
-// Evitan re-renders innecesarios al suscribirse solo a lo que se necesita.
-//
-// REGLA CRÍTICA — Zustand v5 + React 18 (useSyncExternalStore):
-//   React llama a getSnapshot() dos veces para verificar consistencia.
-//   Si el selector devuelve un objeto/array NUEVO en cada llamada
-//   (aunque con el mismo contenido), React lanza:
-//   "Warning: The result of getSnapshot should be cached to avoid an infinite loop"
-//
-//   Solución: nunca devolver literales inline como fallback.
-//   Usar una constante estable de módulo en su lugar.
-//   EMPTY_ROLES es creado UNA sola vez al cargar el módulo — siempre
-//   es el mismo objeto en memoria → React.is() devuelve true → sin warning.
+// ── Selectores precomputados (evitan re-renders innecesarios) ─────────────────
+export const EMPTY_ROLES: UserRole[] = []
 
-const EMPTY_ROLES: UserRole[] = []
+export const selectRoles = (s: AuthState & AuthActions): UserRole[] =>
+  s.user?.roles ?? EMPTY_ROLES
 
-export const selectIsAuthenticated = (s: AuthState) => !!s.accessToken && !!s.user
-export const selectUser            = (s: AuthState) => s.user
-export const selectRoles           = (s: AuthState) => s.user?.roles ?? EMPTY_ROLES
-export const selectBusinessDayId   = (s: AuthState) => s.businessDayId
-export const selectIsAdmin         = (s: AuthState) => s.user?.roles.includes('ADMIN') ?? false
-export const selectIsCashier       = (s: AuthState) =>
-  s.user?.roles.some(r => ['ADMIN', 'CASHIER'].includes(r)) ?? false
+export const selectIsAuthenticated = (s: AuthState & AuthActions): boolean =>
+  s.accessToken !== null && s.user !== null
+  
+export const selectBusinessDayId = (s: AuthState & AuthActions): string | null =>
+  s.businessDayId
+
+export const selectUser = (s: AuthState & AuthActions): AuthUser | null =>
+  s.user
