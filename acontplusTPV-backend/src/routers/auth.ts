@@ -42,7 +42,7 @@ export const authRouter = router({
   // ---------------------------------------------------------------------------
   listEstablishments: procedure
     .input(z.object({ tenantSlug: z.string().min(1) }))
-    .mutation(async ({ input }) => {
+    .query(async ({ input }) => {
       const tenant = await prisma.tenant.findUnique({
         where: { slug: input.tenantSlug },
       })

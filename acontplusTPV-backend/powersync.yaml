@@ -1,0 +1,10 @@
+port: 8080
+postgres:
+  uri: postgresql://powersync:powersync123@postgres:5432/acontplustpv?sslaccept=unsafe_allow_self_signed
+storage:
+  type: postgresql
+  uri: postgresql://powersync:powersync123@postgres:5432/acontplustpv?sslaccept=unsafe_allow_self_signed
+sync:
+  rules_file: /home/node/packages/service/sync-rules.yaml
+client_auth:
+  secret: tu_secreto_powersync_2026

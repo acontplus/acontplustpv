@@ -61,6 +61,7 @@ services:
         -c default_statistics_target=100
         -c random_page_cost=1.1
         -c effective_io_concurrency=200
+        -c wal_level=logical
 
   # ── Redis 7 ────────────────────────────────────────────────────────────────
   redis:
@@ -117,13 +118,7 @@ services:
         condition: service_healthy
     # Sin "ports" — la API NO está expuesta directamente; pasa por nginx
     healthcheck:
-      test:
-        [
-          "CMD",
-          "node",
-          "-e",
-          "fetch('http://localhost:3000/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"
-        ]
+      test: ["CMD", "node", "-e", "const urls=['http://localhost:3000/health','http://localhost:3000/api/health'];(async()=>{for(const u of urls){try{const r=await fetch(u);if(r.ok)process.exit(0);}catch(e){}}process.exit(1);})();"]
       interval: 30s
       timeout:  10s
       retries:  3
@@ -131,7 +126,7 @@ services:
 
   # ── PowerSync Open Edition ──────────────────────────────────────────────────
   powersync:
-    image: journeyapps/powersync-service:latest
+    image: powersync-local:latest
     container_name: acontplus_powersync
     restart: unless-stopped
     environment:
@@ -141,7 +136,12 @@ services:
       POWERSYNC_JWT_SECRET: ${POWERSYNC_JWT_SECRET}
       # URL pública de la API para que los clientes se autentiquen
       API_URL:              ${API_PUBLIC_URL}
+      PS_TLS_INSECURE:    "1"
+      PS_EXTRA_CA_PATH:   /run/secrets/postgres_ca.pem
+    secrets:
+      - postgres_ca.pem
     volumes:
+      - ./powersync.yaml:/app/powersync.yaml:ro
       # Archivo de sync rules — define qué datos bajan a cada dispositivo
       - ./powersync/sync-rules.yaml:/home/node/packages/service/sync-rules.yaml:ro
       - powersync_data:/home/node/packages/service/data
@@ -153,13 +153,7 @@ services:
         condition: service_healthy
     # Sin "ports" — PowerSync NO está expuesto directamente; pasa por nginx
     healthcheck:
-      test:
-        [
-          "CMD",
-          "node",
-          "-e",
-          "fetch('http://localhost:8080/probes/liveness').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"
-        ]
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/probes/liveness').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout:  10s
       retries:  3
@@ -206,9 +200,14 @@ networks:
   # NUNCA expuesta a internet directamente
   internal:
     driver: bridge
-    internal: true   # Docker bloquea todo tráfico externo a esta red
+    # internal: true  # Disabled - blocks pgwire protocol   # Docker bloquea todo tráfico externo a esta red
 
   # Red proxy: nginx, api, powersync
   # nginx termina TLS y proxea hacia api y powersync
   proxy:
     driver: bridge
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+secrets:
+  postgres_ca.pem:
+    file: ./secrets/postgres_ca.pem
