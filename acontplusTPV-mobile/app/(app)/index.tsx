@@ -27,7 +27,6 @@
 //   donde el mesero/barman arma el pedido y lo confirma.
 // =============================================================================
 
-import { router } from 'expo-router';
 import { useState, useEffect, useCallback } from 'react'
 import {
   View,
@@ -42,6 +41,7 @@ import { StatusBar }                 from 'expo-status-bar'
 import { useQuery }                  from '@powersync/react'
 
 import { useBusinessDay }            from '../../src/hooks/useBusinessDay'
+import { useNewOrder }               from '../../src/hooks/useNewOrder'
 import {
   useAuthStore,
   selectUser,
@@ -315,6 +315,11 @@ export default function OrdersScreen() {
 
   // Sincroniza businessDayId al store automáticamente
   useBusinessDay()
+  const {
+    startNewOrder,
+    canStartOrder,
+    isLoading: isEstablishmentLoading,
+  } = useNewOrder()
 
   const isWaiter   = roles.includes('WAITER') && !roles.includes('ADMIN') && !roles.includes('CASHIER') && !roles.includes('BARMAN')
   const isCashier  = roles.some(r => r === 'ADMIN' || r === 'CASHIER')
@@ -431,14 +436,23 @@ export default function OrdersScreen() {
         />
       )}
 
-      {/* FAB — Nuevo pedido (Sprint 4) */}
+      {/* FAB — Nuevo pedido */}
       {businessDayId && (
         <TouchableOpacity
-          onPress={() => router.push('/(app)/new-order')}
-          className="absolute bottom-8 right-6 w-14 h-14 bg-blue-600 rounded-full items-center justify-center shadow-lg active:bg-blue-700"
+          onPress={startNewOrder}
+          disabled={!canStartOrder || isEstablishmentLoading}
+          className={`absolute bottom-8 right-6 w-14 h-14 rounded-full items-center justify-center shadow-lg ${
+            canStartOrder && !isEstablishmentLoading
+              ? 'bg-blue-600 active:bg-blue-700'
+              : 'bg-slate-600'
+          }`}
           style={{ elevation: 6 }}
         >
-          <Text className="text-white text-3xl font-light leading-none">+</Text>
+          {isEstablishmentLoading ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <Text className="text-white text-3xl font-light leading-none">+</Text>
+          )}
         </TouchableOpacity>
       )}
     </View>
