@@ -176,6 +176,11 @@ enum CreditEventType {
   DISCOUNT_APPLIED
 }
 
+enum ServiceModel {
+  COUNTER
+  DINE_IN
+}
+
 // =============================================================================
 // MULTI-TENANT
 // =============================================================================
@@ -238,6 +243,7 @@ model Establishment {
   name      String
   address   String?
   phone     String?
+  serviceModel ServiceModel @default(DINE_IN)
   isActive  Boolean   @default(true)
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
