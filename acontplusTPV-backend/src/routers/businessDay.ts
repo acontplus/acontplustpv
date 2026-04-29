@@ -19,7 +19,7 @@ import { TRPCError }     from '@trpc/server'
 import { router }        from '../trpc'
 import { cashierProcedure, anyUserRoleProcedure } from '../middleware/auth'
 import { withTenant, withTenantOptions } from '../lib/rls'
-import { CashEventType } from '@prisma/client'
+import { CashEventType, ServiceModel } from '@prisma/client'
 
 // =============================================================================
 // SCHEMAS DE ENTRADA
@@ -44,6 +44,12 @@ const closeDayInput = z.object({
 const statusInput = z.object({
   establishmentId: z.string().uuid(),
 })
+
+function buildSeqName(establishmentId: string, businessDayId: string): string {
+  const est = establishmentId.replace(/-/g, '')
+  const day = businessDayId.replace(/-/g, '')
+  return `turno_${est}_${day}`
+}
 
 // =============================================================================
 // ROUTER
@@ -73,7 +79,7 @@ export const businessDayRouter = router({
             isActive:  true,
             deletedAt: null,
           },
-          select: { id: true, name: true, code: true },
+          select: { id: true, name: true, code: true, serviceModel: true },
         }),
       )
 
@@ -154,6 +160,13 @@ export const businessDayRouter = router({
             },
           })
 
+          if (establishment.serviceModel === ServiceModel.COUNTER) {
+            const seqName = buildSeqName(input.establishmentId, businessDay.id)
+            await tx.$executeRawUnsafe(
+              `CREATE SEQUENCE IF NOT EXISTS "${seqName}" START 1 INCREMENT 1`
+            )
+          }
+
           return businessDay
         },
         { timeout: 10_000 },
@@ -168,9 +181,10 @@ export const businessDayRouter = router({
           openedBy:        result.openedBy,
         },
         establishment: {
-          id:   establishment.id,
-          name: establishment.name,
-          code: establishment.code,
+          id:           establishment.id,
+          name:         establishment.name,
+          code:         establishment.code,
+          serviceModel: establishment.serviceModel,
         },
         initialCash: input.initialCash,
         message:     `Jornada abierta en ${establishment.name}`,
@@ -213,6 +227,13 @@ export const businessDayRouter = router({
           message: 'Jornada no encontrada, ya cerrada, o no pertenece a este establecimiento',
         })
       }
+
+      const establishment = await withTenant(tenantId, (tx) =>
+        tx.establishment.findFirst({
+          where:  { id: input.establishmentId, tenantId, isActive: true, deletedAt: null },
+          select: { serviceModel: true },
+        }),
+      )
 
       // Encontrar dispositivo del cajero
       const device = await withTenant(tenantId, (tx) =>
@@ -339,6 +360,13 @@ export const businessDayRouter = router({
               closedBy: ctx.auth.userId!,
             },
           })
+
+          if (establishment?.serviceModel === ServiceModel.COUNTER) {
+            const seqName = buildSeqName(input.establishmentId, input.businessDayId)
+            await tx.$executeRawUnsafe(
+              `DROP SEQUENCE IF EXISTS "${seqName}"`
+            )
+          }
         },
         { timeout: 15_000 },
       )

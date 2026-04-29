@@ -266,8 +266,7 @@ async function deductStock(
 // Reglas:
 //   DINE_IN -> exige tableId o tableAlias real (trimmed, no vacio)
 //   COUNTER -> prohíbe mesa y genera turno atomico T-N con sequence por
-//              establecimiento + jornada. CREATE SEQUENCE queda como fallback
-//              de transicion hasta moverlo a businessDay.open en PR3.
+//              establecimiento + jornada.
 // =============================================================================
 async function validateServiceModel(
   tx: Parameters<Parameters<typeof withTenantOptions>[1]>[0],
@@ -320,10 +319,6 @@ async function validateServiceModel(
     const estSafe = params.establishmentId.replace(/-/g, '')
     const daySafe = params.businessDayId.replace(/-/g, '')
     const seqName = `turno_${estSafe}_${daySafe}`
-
-    await tx.$executeRawUnsafe(
-      `CREATE SEQUENCE IF NOT EXISTS "${seqName}" START 1 INCREMENT 1`
-    )
 
     const [turnRow] = await tx.$queryRawUnsafe<Array<{ nextval: bigint }>>(
       `SELECT nextval('"${seqName}"')`
