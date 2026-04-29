@@ -180,12 +180,16 @@ class AcontPlusConnector {
 
     try {
       const apiUrl = getApiUrl()
+      const resolvedPowerSyncEndpoint = powerSyncUrl ?? getPowerSyncUrl()
+      console.log('[PowerSync] endpoint:', resolvedPowerSyncEndpoint)
+      console.log('[PowerSync] apiUrl:', apiUrl)
       const response = await fetch(`${apiUrl}/auth/powersync-token`, {
         method:  'POST',
         headers: {
           'Authorization': `Bearer ${accessToken}`,
         },
       })
+      console.log('[PowerSync] token fetch status:', response.status)
 
       if (response.status === 401) {
         const newAccessToken = await refreshAccessToken()
@@ -197,12 +201,14 @@ class AcontPlusConnector {
             'Authorization': `Bearer ${newAccessToken}`,
           },
         })
+        console.log('[PowerSync] token fetch retry status:', retryResponse.status)
 
         if (!retryResponse.ok) return null
 
         const retryData = await retryResponse.json() as { token: string }
+        console.log('[PowerSync] token received (retry):', retryData.token?.slice(0, 24) ?? 'null')
         return {
-          endpoint: powerSyncUrl ?? getPowerSyncUrl(),
+          endpoint: resolvedPowerSyncEndpoint,
           token:    retryData.token,
         }
       }
@@ -210,8 +216,9 @@ class AcontPlusConnector {
       if (!response.ok) return null
 
       const data = await response.json() as { token: string }
+      console.log('[PowerSync] token received:', data.token?.slice(0, 24) ?? 'null')
       return {
-        endpoint: powerSyncUrl ?? getPowerSyncUrl(),
+        endpoint: resolvedPowerSyncEndpoint,
         token:    data.token,
       }
     } catch (err) {
