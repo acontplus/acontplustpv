@@ -46,6 +46,7 @@ import {
   PrintStatus,
   CancellationReason,
   MovementType,
+  ServiceModel,
 }                           from '@prisma/client'
 
 // =============================================================================
@@ -254,6 +255,88 @@ async function deductStock(
   }
 
   return { stockDeducted: true, warehouseId }
+}
+
+// =============================================================================
+// HELPER: Validación de serviceModel
+//
+// Aplica reglas COUNTER / DINE_IN al confirmar un pedido.
+// syncOrder se mantiene sin cambios para permitir DRAFT offline.
+//
+// Reglas:
+//   DINE_IN -> exige tableId o tableAlias real (trimmed, no vacio)
+//   COUNTER -> prohíbe mesa y genera turno atomico T-N con sequence por
+//              establecimiento + jornada. CREATE SEQUENCE queda como fallback
+//              de transicion hasta moverlo a businessDay.open en PR3.
+// =============================================================================
+async function validateServiceModel(
+  tx: Parameters<Parameters<typeof withTenantOptions>[1]>[0],
+  params: {
+    tenantId:        string
+    establishmentId: string
+    businessDayId:   string
+    orderId:         string
+    tableId:         string | null
+    tableAlias:      string | null
+  },
+): Promise<{ kioskTurnNumber: string | null }> {
+  const normalizedAlias = params.tableAlias?.trim() || null
+
+  const establishment = await tx.establishment.findFirst({
+    where: {
+      id:        params.establishmentId,
+      tenantId:  params.tenantId,
+      isActive:  true,
+      deletedAt: null,
+    },
+    select: { serviceModel: true },
+  })
+
+  if (!establishment) {
+    throw new TRPCError({
+      code:    'NOT_FOUND',
+      message: 'Establecimiento no encontrado o inactivo',
+    })
+  }
+
+  if (establishment.serviceModel === ServiceModel.DINE_IN) {
+    if (!params.tableId && !normalizedAlias) {
+      throw new TRPCError({
+        code:    'BAD_REQUEST',
+        message: 'Este establecimiento requiere asignar una mesa antes de confirmar el pedido.',
+      })
+    }
+    return { kioskTurnNumber: null }
+  }
+
+  if (establishment.serviceModel === ServiceModel.COUNTER) {
+    if (params.tableId || normalizedAlias) {
+      throw new TRPCError({
+        code:    'BAD_REQUEST',
+        message: 'Este establecimiento opera en modo barra (Counter) y no admite asignacion de mesa.',
+      })
+    }
+
+    const estSafe = params.establishmentId.replace(/-/g, '')
+    const daySafe = params.businessDayId.replace(/-/g, '')
+    const seqName = `turno_${estSafe}_${daySafe}`
+
+    await tx.$executeRawUnsafe(
+      `CREATE SEQUENCE IF NOT EXISTS "${seqName}" START 1 INCREMENT 1`
+    )
+
+    const [turnRow] = await tx.$queryRawUnsafe<Array<{ nextval: bigint }>>(
+      `SELECT nextval('"${seqName}"')`
+    )
+
+    const turnNumber = Number(turnRow!.nextval)
+    return { kioskTurnNumber: `T-${turnNumber}` }
+  }
+
+  throw new TRPCError({
+    code:    'INTERNAL_SERVER_ERROR',
+    message: `serviceModel desconocido: ${establishment.serviceModel}`,
+  })
 }
 
 // =============================================================================
@@ -483,8 +566,13 @@ export const orderRouter = router({
             pointOfSaleId:   string
             deviceId:        string
             createdByUserId: string | null
+            tableId:         string | null
+            tableAlias:      string | null
+            kioskTurnNumber: string | null
           }>>`
-            SELECT id, status, "businessDayId", "pointOfSaleId", "deviceId", "createdByUserId"
+            SELECT
+              id, status, "businessDayId", "pointOfSaleId", "deviceId", "createdByUserId",
+              "tableId", "tableAlias", "kioskTurnNumber"
             FROM "Order"
             WHERE "tenantId" = ${tenantId}::uuid
               AND "localSequence" = ${input.localSequence}
@@ -512,6 +600,15 @@ export const orderRouter = router({
               message: 'El pedido pertenece a una jornada anterior. No puede confirmarse en esta jornada.',
             })
           }
+
+          const { kioskTurnNumber: generatedTurn } = await validateServiceModel(tx, {
+            tenantId,
+            establishmentId,
+            businessDayId,
+            orderId:    locked.id,
+            tableId:    locked.tableId,
+            tableAlias: locked.tableAlias,
+          })
 
           // Cargar items y productos ahora que la fila está bloqueada
           const order = await tx.order.findUnique({
@@ -583,6 +680,7 @@ export const orderRouter = router({
               orderNumber,
               subtotal,
               totalAmount,
+              kioskTurnNumber: generatedTurn,
             },
           })
 
