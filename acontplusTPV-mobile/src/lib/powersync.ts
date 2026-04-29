@@ -24,11 +24,21 @@ import {
   Schema,
   Table,
 }                             from '@powersync/react-native'
+import Constants              from 'expo-constants'
 import { useAuthStore }       from '../store/auth'
 
-// URLs hardcodeadas — evitan dependencia de Constants.expoConfig en runtime
-const API_URL        = 'https://api.resuelveyaa.com'
-const POWERSYNC_URL  = 'https://powersync.resuelveyaa.com'
+// Precedencia de URLs:
+// 1) Constants.expoConfig.extra.* (inyectado por app.config.ts / EAS env)
+// 2) Fallback localhost para desarrollo sin .env
+function getApiUrl(): string {
+  const url = Constants.expoConfig?.extra?.apiUrl
+  return typeof url === 'string' && url.length > 0 ? url : 'http://localhost:3000'
+}
+
+function getPowerSyncUrl(): string {
+  const url = Constants.expoConfig?.extra?.powerSyncUrl
+  return typeof url === 'string' && url.length > 0 ? url : 'http://localhost:8080'
+}
 
 // =============================================================================
 // SCHEMAS SQLite — espejo del schema Prisma (solo campos necesarios offline)
@@ -87,11 +97,13 @@ const businessDaySchema = new Table({
 
 // ── Establishment ─────────────────────────────────────────────────────────────
 const establishmentSchema = new Table({
-  code:      column.text,
-  name:      column.text,
-  address:   column.text,
-  phone:     column.text,
-  is_active: column.integer,
+  tenant_id:     column.text,
+  code:          column.text,
+  name:          column.text,
+  address:       column.text,
+  phone:         column.text,
+  service_model: column.text,
+  is_active:     column.integer,
 })
 
 // ── Order ─────────────────────────────────────────────────────────────────────
@@ -167,7 +179,8 @@ class AcontPlusConnector {
     if (!accessToken) return null
 
     try {
-      const response = await fetch(`${API_URL}/auth/powersync-token`, {
+      const apiUrl = getApiUrl()
+      const response = await fetch(`${apiUrl}/auth/powersync-token`, {
         method:  'POST',
         headers: {
           'Authorization': `Bearer ${accessToken}`,
@@ -178,7 +191,7 @@ class AcontPlusConnector {
         const newAccessToken = await refreshAccessToken()
         if (!newAccessToken) return null
 
-        const retryResponse = await fetch(`${API_URL}/auth/powersync-token`, {
+        const retryResponse = await fetch(`${apiUrl}/auth/powersync-token`, {
           method:  'POST',
           headers: {
             'Authorization': `Bearer ${newAccessToken}`,
@@ -189,7 +202,7 @@ class AcontPlusConnector {
 
         const retryData = await retryResponse.json() as { token: string }
         return {
-          endpoint: powerSyncUrl ?? POWERSYNC_URL,
+          endpoint: powerSyncUrl ?? getPowerSyncUrl(),
           token:    retryData.token,
         }
       }
@@ -198,7 +211,7 @@ class AcontPlusConnector {
 
       const data = await response.json() as { token: string }
       return {
-        endpoint: powerSyncUrl ?? POWERSYNC_URL,
+        endpoint: powerSyncUrl ?? getPowerSyncUrl(),
         token:    data.token,
       }
     } catch (err) {
