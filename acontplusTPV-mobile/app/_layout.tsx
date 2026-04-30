@@ -90,30 +90,26 @@ export default function RootLayout() {
   const router   = useRouter()
   const segments = useSegments()
 
-  // ── Inicialización de PowerSync ───────────────────────────────────────────
-  // Se ejecuta una sola vez al montar el Root Layout.
-  // Abre la base de datos SQLite y conecta el conector al servidor.
-  // powerSyncDb.connect() inicia la sincronización en background — no bloquea.
+  // ── Inicialización de PowerSync (solo SQLite) ───────────────────────────
+  // connect() NO va aquí: antes corría en paralelo con SecureStore y fetchCredentials()
+  // podía ejecutarse sin accessToken → WS 101 y cierre casi inmediato (nginx urt corto).
   useEffect(() => {
     initPowerSync()
       .then(() => setIsPowerSyncReady(true))
       .catch((err) => {
-        // PowerSync falló — logear pero continuar: la app puede operar
-        // sin sincronización (modo solo-lectura de datos ya almacenados).
         console.error('[PowerSync] Error al inicializar:', err)
-        // Marcamos como ready de todos modos para no bloquear la app
         setIsPowerSyncReady(true)
       })
   }, [])
 
-  // ── Restaurar sesión de SecureStore ──────────────────────────────────────
-  // Se ejecuta una sola vez. Lee accessToken + refreshToken + user del Keychain
-  // y los carga en el store de Zustand para que el Guard los detecte.
+  // ── Restaurar sesión DESPUÉS de que SQLite esté listo ────────────────────
+  // Orden estricto: init → tokens en store → loadStoredSession.connect() en auth.ts
   useEffect(() => {
+    if (!isPowerSyncReady) return
     loadStoredSession()
       .then(() => setIsSessionLoaded(true))
-      .catch(() => setIsSessionLoaded(true)) // Siempre marcar como listo
-  }, [loadStoredSession])
+      .catch(() => setIsSessionLoaded(true))
+  }, [isPowerSyncReady, loadStoredSession])
 
   // ── CORRECCIÓN BUG PIN-NAV: Navegación reactiva desde el layout raíz ─────
   //

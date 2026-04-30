@@ -181,6 +181,8 @@ class AcontPlusConnector {
     try {
       const apiUrl = getApiUrl()
       const resolvedPowerSyncEndpoint = powerSyncUrl ?? getPowerSyncUrl()
+      console.log('[PowerSync] store powerSyncUrl:', powerSyncUrl ?? 'null')
+      console.log('[PowerSync] fallback getPowerSyncUrl():', getPowerSyncUrl())
       console.log('[PowerSync] endpoint:', resolvedPowerSyncEndpoint)
       console.log('[PowerSync] apiUrl:', apiUrl)
       const response = await fetch(`${apiUrl}/auth/powersync-token`, {
@@ -207,6 +209,10 @@ class AcontPlusConnector {
 
         const retryData = await retryResponse.json() as { token: string }
         console.log('[PowerSync] token received (retry):', retryData.token?.slice(0, 24) ?? 'null')
+        console.log('[PowerSync] returning credentials:', {
+          endpoint: resolvedPowerSyncEndpoint,
+          tokenPreview: retryData.token?.slice(0, 50) ?? 'null',
+        })
         return {
           endpoint: resolvedPowerSyncEndpoint,
           token:    retryData.token,
@@ -217,6 +223,10 @@ class AcontPlusConnector {
 
       const data = await response.json() as { token: string }
       console.log('[PowerSync] token received:', data.token?.slice(0, 24) ?? 'null')
+      console.log('[PowerSync] returning credentials:', {
+        endpoint: resolvedPowerSyncEndpoint,
+        tokenPreview: data.token?.slice(0, 50) ?? 'null',
+      })
       return {
         endpoint: resolvedPowerSyncEndpoint,
         token:    data.token,
@@ -246,9 +256,9 @@ export const powerSyncDb = new PowerSyncDatabase({
 
 export const connector = new AcontPlusConnector()
 
+/** Abre SQLite. No llama a connect(): el conector sin accessToken devolvería null y el stream cerraría al instante. Tras init, _layout dispara loadStoredSession (o login) y esos flujos llaman connect() con token ya en el store. */
 export async function initPowerSync(): Promise<void> {
   await powerSyncDb.init()
-  await powerSyncDb.connect(connector)
 }
 
 export async function disconnectAndClear(): Promise<void> {
