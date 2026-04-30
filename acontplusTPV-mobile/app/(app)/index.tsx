@@ -199,13 +199,21 @@ function usePowerSyncConnected(): SyncStatus {
   }))
 
   useEffect(() => {
+    console.log('[Badge][mount]', { connected: powerSyncDb.connected === true })
     setStatus({ connected: powerSyncDb.connected === true, syncing: false })
     const unsub = powerSyncDb.registerListener({
-      statusChanged: (s) => setStatus({
-        connected: s.connected === true,
-        syncing:   (s.dataFlowStatus?.downloading === true) ||
-                   (s.dataFlowStatus?.uploading   === true),
-      }),
+      statusChanged: (s) => {
+        console.log('[Badge][statusChanged]', {
+          connected:   s.connected,
+          downloading: s.dataFlowStatus?.downloading,
+          uploading:   s.dataFlowStatus?.uploading,
+        })
+        setStatus({
+          connected: s.connected === true,
+          syncing:   (s.dataFlowStatus?.downloading === true) ||
+                     (s.dataFlowStatus?.uploading   === true),
+        })
+      },
     })
     return () => { unsub() }
   }, [])
