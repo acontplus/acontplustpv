@@ -38,7 +38,7 @@ import {
   Alert,
 }                                    from 'react-native'
 import { StatusBar }                 from 'expo-status-bar'
-import { useQuery }                  from '@powersync/react'
+import { useQuery, useStatus }       from '@powersync/react'
 
 import { useBusinessDay }            from '../../src/hooks/useBusinessDay'
 import { useNewOrder }               from '../../src/hooks/useNewOrder'
@@ -48,8 +48,6 @@ import {
   selectRoles,
   selectBusinessDayId,
 }                                    from '../../src/store/auth'
-import { powerSyncDb }               from '../../src/lib/powersync'
-
 // =============================================================================
 // TIPOS
 // =============================================================================
@@ -187,54 +185,57 @@ function useActiveOrders(businessDayId: string | null, userId: string | null, is
 }
 
 // =============================================================================
-// BADGE DE SYNC (reutilizado del Sprint 2)
+// BADGE DE SYNC — useStatus(): misma fuente que useQuery / PowerSyncContext
 // =============================================================================
 
-type SyncStatus = { connected: boolean; syncing: boolean }
-
-function usePowerSyncConnected(): SyncStatus {
-  const [status, setStatus] = useState<SyncStatus>(() => ({
-    connected: powerSyncDb.connected === true,
-    syncing:   false,
-  }))
+function SyncBadge() {
+  const ps = useStatus()
+  const downloading = ps.dataFlowStatus?.downloading === true
+  const uploading   = ps.dataFlowStatus?.uploading === true
+  const syncing     = downloading || uploading
+  const handshake   = ps.connecting === true
+  const flowErr     =
+    ps.dataFlowStatus?.downloadError ?? ps.dataFlowStatus?.uploadError
 
   useEffect(() => {
-    console.log('[Badge][mount]', { connected: powerSyncDb.connected === true })
-    setStatus({ connected: powerSyncDb.connected === true, syncing: false })
-    const unsub = powerSyncDb.registerListener({
-      statusChanged: (s) => {
-        console.log('[Badge][statusChanged]', {
-          connected:   s.connected,
-          downloading: s.dataFlowStatus?.downloading,
-          uploading:   s.dataFlowStatus?.uploading,
-        })
-        setStatus({
-          connected: s.connected === true,
-          syncing:   (s.dataFlowStatus?.downloading === true) ||
-                     (s.dataFlowStatus?.uploading   === true),
-        })
-      },
-    })
-    return () => { unsub() }
-  }, [])
+    if (__DEV__ && flowErr != null) {
+      console.warn('[PowerSync][dataFlow error]', flowErr.message ?? String(flowErr))
+    }
+  }, [flowErr])
 
-  return status
-}
+  const showLive = ps.connected === true || handshake || syncing
 
-function SyncBadge() {
-  const { connected, syncing } = usePowerSyncConnected()
-  if (connected && !syncing) return (
-    <View className="flex-row items-center gap-1 bg-emerald-500/20 px-2 py-1 rounded-full">
-      <View className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-      <Text className="text-emerald-400 text-xs">Sync</Text>
-    </View>
-  )
-  if (syncing) return (
-    <View className="flex-row items-center gap-1 bg-blue-500/20 px-2 py-1 rounded-full">
-      <ActivityIndicator size={8} color="#60a5fa" />
-      <Text className="text-blue-400 text-xs">Sync...</Text>
-    </View>
-  )
+  useEffect(() => {
+    if (__DEV__) {
+      console.log('[Badge][useStatus]', {
+        connected:  ps.connected,
+        connecting: ps.connecting,
+        downloading,
+        uploading,
+        hasSynced:  ps.hasSynced,
+        err:        flowErr?.message ?? null,
+      })
+    }
+  }, [ps.connected, ps.connecting, downloading, uploading, ps.hasSynced, flowErr])
+
+  if (ps.connected === true && !syncing && !flowErr) {
+    return (
+      <View className="flex-row items-center gap-1 bg-emerald-500/20 px-2 py-1 rounded-full">
+        <View className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+        <Text className="text-emerald-400 text-xs">Sync</Text>
+      </View>
+    )
+  }
+
+  if (showLive) {
+    return (
+      <View className="flex-row items-center gap-1 bg-blue-500/20 px-2 py-1 rounded-full">
+        <ActivityIndicator size={8} color="#60a5fa" />
+        <Text className="text-blue-400 text-xs">Sync...</Text>
+      </View>
+    )
+  }
+
   return (
     <View className="flex-row items-center gap-1 bg-slate-700 px-2 py-1 rounded-full">
       <View className="w-1.5 h-1.5 rounded-full bg-slate-500" />

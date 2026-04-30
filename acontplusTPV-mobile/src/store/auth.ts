@@ -158,15 +158,8 @@ export const useAuthStore = create<AuthState & AuthActions>()(
           state.error        = null
         })
 
-        // Paso 5: reconectar PowerSync con el nuevo accessToken
-        // Se llama DESPUÉS del set() para que fetchCredentials() encuentre
-        // el accessToken ya disponible en el store cuando PowerSync lo solicite.
-        try {
-          const { powerSyncDb, connector } = await import('../lib/powersync')
-          await powerSyncDb.connect(connector)
-        } catch (psErr) {
-          console.warn('[auth] PowerSync reconnect (login) non-blocking:', psErr)
-        }
+        // PowerSync: connect() desde app/_layout.tsx (import estático —
+        // el dynamic import desde el store puede no ser la misma instancia que el Provider).
 
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : 'Error al iniciar sesión'
@@ -273,13 +266,8 @@ export const useAuthStore = create<AuthState & AuthActions>()(
           state.powerSyncUrl = Constants.expoConfig?.extra?.powerSyncUrl || POWERSYNC_URL
         })
 
-        // Reconectar PowerSync al restaurar sesión desde SecureStore
-        try {
-          const { powerSyncDb, connector } = await import('../lib/powersync')
-          await powerSyncDb.connect(connector)
-        } catch {
-          // non-blocking — PowerSync reintentará en background
-        }
+        // PowerSync: connect() en app/_layout.tsx tras session + init (misma instancia que Provider)
+
       } catch {
         // SecureStore vacío o datos corruptos — arrancar sin sesión
       }

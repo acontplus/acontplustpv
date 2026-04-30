@@ -7,7 +7,8 @@ import '../global.css'
 //   1. Prevenir que el splash screen se oculte antes de que todo esté listo
 //   2. Inicializar PowerSync (SQLite nativo) — DEBE ocurrir antes del primer render
 //   3. Restaurar la sesión guardada en SecureStore (loadStoredSession)
-//   4. Una vez todo listo: ocultar splash y renderizar el árbol de navegación
+//   4. Conectar PowerSync desde aquí cuando init + sesión listos y hay auth (instancia única)
+//   5. Una vez todo listo: ocultar splash y renderizar el árbol de navegación
 //
 // Providers en este layout (de exterior a interior):
 //   PowerSyncContext.Provider → contexto de SQLite para toda la app
@@ -62,7 +63,7 @@ import { PowerSyncContext }                  from '@powersync/react'
 
 import { trpc, createTrpcQueryClient }       from '../src/lib/trpc'
 import { queryClient }                       from '../src/lib/queryClient'
-import { initPowerSync, powerSyncDb }        from '../src/lib/powersync'
+import { connector, initPowerSync, powerSyncDb } from '../src/lib/powersync'
 import { useAuthStore, selectIsAuthenticated } from '../src/store/auth'
 
 // Mantener el splash visible hasta que explícitamente lo ocultemos
@@ -103,13 +104,36 @@ export default function RootLayout() {
   }, [])
 
   // ── Restaurar sesión DESPUÉS de que SQLite esté listo ────────────────────
-  // Orden estricto: init → tokens en store → loadStoredSession.connect() en auth.ts
+  // Orden estricto: init → tokens vía loadStoredSession (solo store; sin connect aquí).
   useEffect(() => {
     if (!isPowerSyncReady) return
     loadStoredSession()
       .then(() => setIsSessionLoaded(true))
       .catch(() => setIsSessionLoaded(true))
   }, [isPowerSyncReady, loadStoredSession])
+
+  // ── PowerSync connect: misma instancia que Provider (sin dynamic import desde auth store) ─
+  useEffect(() => {
+    if (!isPowerSyncReady || !isSessionLoaded || !isAuthenticated) return
+
+    let cancelled = false
+    void (async () => {
+      try {
+        // Evita carreras ConnectionManager si hubo logout/login rápido o StrictMode doble-mount
+        await powerSyncDb.disconnect().catch(() => {})
+        if (cancelled) return
+        await powerSyncDb.connect(connector)
+      } catch (err) {
+        if (!cancelled) {
+          console.warn('[PowerSync] connect desde root layout (non-blocking):', err)
+        }
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [isPowerSyncReady, isSessionLoaded, isAuthenticated])
 
   // ── CORRECCIÓN BUG PIN-NAV: Navegación reactiva desde el layout raíz ─────
   //
