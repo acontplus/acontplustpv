@@ -36,17 +36,21 @@ bucket_definitions:
   # comparten el mismo bucket de catálogo.
   # ============================================================================
   tenant_catalog:
-    parameters:
-      - name: tenant_id
-        value: token.tenantId
+    parameters: "token.tenantId"
     data:
       # Categorías activas del tenant
-      - table: ProductCategory
-        where: "\"tenantId\" = {tenant_id} AND \"isActive\" = true AND \"deletedAt\" IS NULL"
+      - >
+        SELECT * FROM "ProductCategory"
+        WHERE "tenantId" = {tenant_id}
+          AND "isActive" = true
+          AND "deletedAt" IS NULL
 
       # Productos activos del tenant con su precio de venta
-      - table: Product
-        where: "\"tenantId\" = {tenant_id} AND \"isActive\" = true AND \"deletedAt\" IS NULL"
+      - >
+        SELECT * FROM "Product"
+        WHERE "tenantId" = {tenant_id}
+          AND "isActive" = true
+          AND "deletedAt" IS NULL
 
   # ============================================================================
   # BUCKET: Stock por establecimiento
@@ -56,12 +60,11 @@ bucket_definitions:
   # El cajero y admin sí necesitan disponibilidad para gestión.
   # ============================================================================
   tenant_stock:
-    parameters:
-      - name: tenant_id
-        value: token.tenantId
+    parameters: "token.tenantId"
     data:
-      - table: StockLevel
-        where: "\"tenantId\" = {tenant_id}"
+      - >
+        SELECT * FROM "StockLevel"
+        WHERE "tenantId" = {tenant_id}
 
   # ============================================================================
   # BUCKET: Mesas por establecimiento
@@ -71,12 +74,13 @@ bucket_definitions:
   # están disponibles para asignar a pedidos.
   # ============================================================================
   tenant_tables:
-    parameters:
-      - name: tenant_id
-        value: token.tenantId
+    parameters: "token.tenantId"
     data:
-      - table: Table
-        where: "\"tenantId\" = {tenant_id} AND \"isActive\" = true AND \"deletedAt\" IS NULL"
+      - >
+        SELECT * FROM "Table"
+        WHERE "tenantId" = {tenant_id}
+          AND "isActive" = true
+          AND "deletedAt" IS NULL
 
   # ============================================================================
   # BUCKET: Establecimiento y configuración
@@ -86,15 +90,17 @@ bucket_definitions:
   # información del negocio y resolver referencias.
   # ============================================================================
   tenant_establishment:
-    parameters:
-      - name: tenant_id
-        value: token.tenantId
+    parameters: "token.tenantId"
     data:
-      - table: Establishment
-        where: "\"tenantId\" = {tenant_id} AND \"isActive\" = true AND \"deletedAt\" IS NULL"
+      - >
+        SELECT * FROM "Establishment"
+        WHERE "tenantId" = {tenant_id}
+          AND "isActive" = true
+          AND "deletedAt" IS NULL
 
-      - table: PointOfSale
-        where: "\"tenantId\" = {tenant_id}"
+      - >
+        SELECT * FROM "PointOfSale"
+        WHERE "tenantId" = {tenant_id}
 
   # ============================================================================
   # BUCKET: Pedidos activos del MESERO (últimas 12 horas)
@@ -112,13 +118,12 @@ bucket_definitions:
   # ============================================================================
   waiter_orders:
     parameters:
-      - name: tenant_id
-        value: token.tenantId
-      - name: user_id
-        value: token.sub
+      - "token.tenantId"
+      - "token.sub"
     data:
-      - table: Order
-        where: >
+      - >
+        SELECT * FROM "Order"
+        WHERE
           "tenantId" = {tenant_id}
           AND "createdByUserId" = {user_id}
           AND "status" NOT IN (
@@ -131,8 +136,9 @@ bucket_definitions:
           AND "createdAt" >= NOW() - INTERVAL '12 hours'
 
       # Items de los pedidos del mesero
-      - table: OrderItem
-        where: >
+      - >
+        SELECT * FROM "OrderItem"
+        WHERE
           "tenantId" = {tenant_id}
           AND "orderId" IN (
             SELECT id FROM "Order"
@@ -156,12 +162,11 @@ bucket_definitions:
   # PowerSync re-evalúa este bucket cuando cambia el estado de BusinessDay.
   # ============================================================================
   cashier_orders:
-    parameters:
-      - name: tenant_id
-        value: token.tenantId
+    parameters: "token.tenantId"
     data:
-      - table: Order
-        where: >
+      - >
+        SELECT * FROM "Order"
+        WHERE
           "tenantId" = {tenant_id}
           AND "businessDayId" IN (
             SELECT id FROM "BusinessDay"
@@ -170,8 +175,9 @@ bucket_definitions:
           )
 
       # Items de todos los pedidos de la jornada
-      - table: OrderItem
-        where: >
+      - >
+        SELECT * FROM "OrderItem"
+        WHERE
           "tenantId" = {tenant_id}
           AND "orderId" IN (
             SELECT o.id FROM "Order" o
@@ -182,8 +188,9 @@ bucket_definitions:
           )
 
       # Transferencias pendientes de conciliación — el cajero las gestiona
-      - table: TransferPayment
-        where: >
+      - >
+        SELECT * FROM "TransferPayment"
+        WHERE
           "tenantId" = {tenant_id}
           AND "status" = 'PENDING'
           AND "businessDayId" IN (
@@ -193,8 +200,9 @@ bucket_definitions:
           )
 
       # Jornada activa — para mostrar resumen de caja
-      - table: BusinessDay
-        where: >
+      - >
+        SELECT * FROM "BusinessDay"
+        WHERE
           "tenantId" = {tenant_id}
           AND "isOpen" = true
 
@@ -210,19 +218,19 @@ bucket_definitions:
   # acumular histórico — solo lo que hay que imprimir ahora.
   # ============================================================================
   print_node_orders:
-    parameters:
-      - name: tenant_id
-        value: token.tenantId
+    parameters: "token.tenantId"
     data:
-      - table: Order
-        where: >
+      - >
+        SELECT * FROM "Order"
+        WHERE
           "tenantId" = {tenant_id}
           AND "printStatus" = 'PENDING'
           AND "createdAt" >= NOW() - INTERVAL '2 hours'
 
       # Items necesarios para renderizar la comanda
-      - table: OrderItem
-        where: >
+      - >
+        SELECT * FROM "OrderItem"
+        WHERE
           "tenantId" = {tenant_id}
           AND "orderId" IN (
             SELECT id FROM "Order"
@@ -243,17 +251,21 @@ bucket_definitions:
   # La configuración del negocio (nombre, logo) viene de tenant_establishment.
   # ============================================================================
   kiosk_catalog:
-    parameters:
-      - name: tenant_id
-        value: token.tenantId
+    parameters: "token.tenantId"
     data:
       # Solo productos activos — mismo filtro que tenant_catalog
       # Bucket separado para poder diferenciar en métricas/debugging
-      - table: Product
-        where: "\"tenantId\" = {tenant_id} AND \"isActive\" = true AND \"deletedAt\" IS NULL"
+      - >
+        SELECT * FROM "Product"
+        WHERE "tenantId" = {tenant_id}
+          AND "isActive" = true
+          AND "deletedAt" IS NULL
 
-      - table: ProductCategory
-        where: "\"tenantId\" = {tenant_id} AND \"isActive\" = true AND \"deletedAt\" IS NULL"
+      - >
+        SELECT * FROM "ProductCategory"
+        WHERE "tenantId" = {tenant_id}
+          AND "isActive" = true
+          AND "deletedAt" IS NULL
 
   # ============================================================================
   # BUCKET: Jornada activa (compartido)
@@ -263,12 +275,11 @@ bucket_definitions:
   # poder crear pedidos o registrar eventos correctamente offline.
   # ============================================================================
   active_business_day:
-    parameters:
-      - name: tenant_id
-        value: token.tenantId
+    parameters: "token.tenantId"
     data:
-      - table: BusinessDay
-        where: >
+      - >
+        SELECT * FROM "BusinessDay"
+        WHERE
           "tenantId" = {tenant_id}
           AND "isOpen" = true
 
@@ -280,11 +291,10 @@ bucket_definitions:
   # Los clientes no se sincronizan por privacidad — se consultan online.
   # ============================================================================
   admin_credits:
-    parameters:
-      - name: tenant_id
-        value: token.tenantId
+    parameters: "token.tenantId"
     data:
-      - table: CreditTransaction
-        where: >
+      - >
+        SELECT * FROM "CreditTransaction"
+        WHERE
           "tenantId" = {tenant_id}
           AND "createdAt" >= NOW() - INTERVAL '90 days'
